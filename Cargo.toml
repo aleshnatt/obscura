@@ -1,0 +1,29 @@
+[package]
+name = "obscura"
+version = "0.2.0"
+edition = "2024"
+authors = ["Naufal Ziyaadaturrahman"]
+description = "Obscura: Anonymous WebAuthn Credential Protocol — A privacy-preserving, ZK-augmented FIDO2/WebAuthn authentication engine with Groth16 proofs over BN254."
+license = "MIT"
+repository = "https://github.com/obscura-protocol/obscura"
+keywords = ["webauthn", "fido2", "zero-knowledge", "privacy", "groth16"]
+categories = ["cryptography", "authentication"]
+
+[dependencies]
+# Arkworks ZK ecosystem (v0.5)
+ark-ff = "0.5"
+ark-ec = "0.5"
+ark-bn254 = "0.5"
+ark-groth16 = "0.5"
+ark-relations = "0.5"
+ark-r1cs-std = "0.5"
+ark-snark = "0.5"
+ark-std = "0.5"
+ark-serialize = "0.5"
+ark-crypto-primitives = { version = "0.5", features = ["sponge", "r1cs"] }
+
+# Utilities
+rand = "0.8"
+thiserror = "1.0"
+hex = "0.4"
+clap = { version = "4.0", features = ["derive"] }
