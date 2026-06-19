@@ -1,18 +1,12 @@
 //! # Obscura Protocol — Error Definitions
 //!
-//! Comprehensive error taxonomy for the Obscura protocol engine.
+//! Comprehensive error taxonomy for the post-quantum Obscura protocol engine.
 
 use thiserror::Error;
 
 /// Unified error type for all Obscura protocol operations.
 #[derive(Debug, Error)]
 pub enum ProtocolError {
-    // ─── Setup Errors ────────────────────────────────────────────────────
-
-    /// The Groth16 trusted setup (CRS generation) failed.
-    #[error("Setup error: trusted setup failed — {reason}")]
-    SetupFailure { reason: String },
-
     // ─── Merkle Tree Errors ──────────────────────────────────────────────
 
     /// The Merkle tree contains no leaves.
@@ -30,7 +24,7 @@ pub enum ProtocolError {
     // ─── Proof Errors ────────────────────────────────────────────────────
 
     /// The prover could not generate a valid ZK proof.
-    #[error("Proof generation error: failed to generate Groth16 proof — {reason}")]
+    #[error("Proof generation error: failed to generate lattice ZK proof — {reason}")]
     ProofGenerationFailure { reason: String },
 
     /// The Merkle inclusion witness is malformed.
@@ -43,29 +37,27 @@ pub enum ProtocolError {
 
     // ─── Verification Errors ─────────────────────────────────────────────
 
-    /// The ZK proof failed Groth16 pairing-based verification.
-    #[error("Verification error: invalid Groth16 proof — pairing check failed")]
+    /// The ZK proof failed lattice-based verification.
+    #[error("Verification error: invalid lattice ZK proof — algebraic relation check failed")]
     InvalidProof,
 
     /// The Merkle root embedded in the proof does not match.
     #[error("Verification error: Merkle root mismatch — proof root does not match the expected anonymity set root")]
     RootMismatch,
 
-    /// The server-issued challenge is invalid.
-    #[error("Verification error: challenge validation failed")]
+    /// The server-issued challenge scope is invalid.
+    #[error("Verification error: challenge scope validation failed")]
     ChallengeFailure,
+
+    /// The response vector norm exceeds the rejection bound.
+    #[error("Verification error: response norm bound exceeded — ‖z‖∞ ≥ γ₁ - β")]
+    NormBoundExceeded,
 
     // ─── Serialization Errors ────────────────────────────────────────────
 
     /// Proof serialization or deserialization failed.
     #[error("Serialization error: {reason}")]
     SerializationError { reason: String },
-
-    // ─── Circuit Errors ──────────────────────────────────────────────────
-
-    /// R1CS constraint synthesis failed.
-    #[error("Circuit error: constraint synthesis failed — {reason}")]
-    SynthesisError { reason: String },
 
     // ─── Generic Cryptographic Errors ────────────────────────────────────
 

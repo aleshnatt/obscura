@@ -1,100 +1,113 @@
 //! # Obscura Protocol — Merkle Tree (Anonymity Set)
 //!
-//! Poseidon-based binary Merkle tree over BN254 scalar field elements.
+//! SHAKE-256-based binary Merkle tree over 32-byte hash digests.
 //!
-//! Each leaf is a Poseidon commitment to a user's credential. The tree
+//! Each leaf is the commitment hash of a user's MLWE public key. The tree
 //! root serves as a compact, tamper-evident digest of the anonymity set.
 //!
-//! ## SNARK-Friendly Design
+//! ## Post-Quantum Design
 //!
-//! Unlike SHA-256 Merkle trees, this tree uses Poseidon hashing which
-//! costs only ~300 R1CS constraints per node — enabling efficient
-//! in-circuit verification of inclusion proofs.
+//! This tree uses SHAKE-256 (a member of the SHA-3 family) which provides
+//! quantum-resistant collision resistance. The hash function is a standard
+//! XOF (Extendable Output Function) from NIST FIPS 202.
 //!
 //! ## Domain Separation
 //!
-//! - **Leaf hash**: `Poseidon(0, leaf_data)` — the zero prefix domain-separates
-//!   leaves from internal nodes, preventing second-preimage attacks.
-//! - **Internal node hash**: `Poseidon(left, right)` — standard 2-to-1 hash.
+//! - **Leaf hash**: `SHAKE-256("COM_DOM" ∥ leaf_data)` — the domain prefix
+//!   separates leaves from internal nodes, preventing second-preimage attacks.
+//! - **Internal node hash**: `SHAKE-256("NODE_DOM" ∥ left ∥ right)` — standard
+//!   2-to-1 hash with its own domain separator.
 
-use ark_bn254::Fr;
-use ark_ff::Zero;
+use serde::{Deserialize, Serialize};
+use sha3::digest::{ExtendableOutput, Update, XofReader};
+use sha3::Shake256;
 
 use crate::error::ProtocolError;
-use crate::poseidon::{poseidon_config, poseidon_hash, poseidon_hash_two};
-use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+/// Domain separator for leaf hashing.
+const LEAF_DOMAIN: &[u8] = b"COM_DOM";
+
+/// Domain separator for internal node hashing.
+const NODE_DOMAIN: &[u8] = b"NODE_DOM";
+
+/// Zero hash (32 bytes of zeros) used for padding empty leaf slots.
+const ZERO_HASH: [u8; 32] = [0u8; 32];
+
+// ─── Hash Functions ──────────────────────────────────────────────────────────
+
+/// Domain-separated leaf hash: SHAKE-256("COM_DOM" ∥ leaf_data), 32 bytes.
+fn hash_leaf(data: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Shake256::default();
+    hasher.update(LEAF_DOMAIN);
+    hasher.update(data);
+    let mut output = [0u8; 32];
+    hasher.finalize_xof().read(&mut output);
+    output
+}
+
+/// Internal node hash: SHAKE-256("NODE_DOM" ∥ left ∥ right), 32 bytes.
+fn hash_node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Shake256::default();
+    hasher.update(NODE_DOMAIN);
+    hasher.update(left);
+    hasher.update(right);
+    let mut output = [0u8; 32];
+    hasher.finalize_xof().read(&mut output);
+    output
+}
 
 // ─── Structs ─────────────────────────────────────────────────────────────────
 
-/// A binary Merkle tree over Poseidon-hashed BN254 field elements.
+/// A binary Merkle tree over SHAKE-256-hashed 32-byte digests.
 #[derive(Debug, Clone)]
 pub struct MerkleTree {
-    /// Raw leaf values (commitments) as inserted by callers.
-    pub leaves: Vec<Fr>,
+    /// Raw leaf values (commitment hashes) as inserted by callers.
+    pub leaves: Vec<[u8; 32]>,
     /// Flattened binary tree array. Index 0 is unused (sentinel), index 1 is root.
-    pub nodes: Vec<Fr>,
-    /// Cached Poseidon configuration (shared across all hash operations).
-    config: PoseidonConfig<Fr>,
+    nodes: Vec<[u8; 32]>,
 }
 
 /// A Merkle inclusion proof for a specific leaf.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MerkleProof {
     /// The raw leaf value whose membership is being proven.
-    pub leaf: Fr,
+    pub leaf: [u8; 32],
     /// Sibling hashes along the path from the leaf to the root.
-    pub siblings: Vec<Fr>,
+    pub siblings: Vec<[u8; 32]>,
     /// Direction at each level: false = left child, true = right child.
     pub path_indices: Vec<bool>,
     /// The Merkle root computed at proof-generation time.
-    pub root: Fr,
+    pub root: [u8; 32],
 }
 
-// ─── Helper Functions ────────────────────────────────────────────────────────
-
-/// Domain-separated leaf hash: `Poseidon(0, leaf_data)`.
-fn hash_leaf(config: &PoseidonConfig<Fr>, data: &Fr) -> Fr {
-    poseidon_hash(config, &[Fr::zero(), *data])
-}
-
-/// Internal node hash: `Poseidon(left, right)`.
-fn hash_node(config: &PoseidonConfig<Fr>, left: &Fr, right: &Fr) -> Fr {
-    poseidon_hash_two(config, left, right)
-}
+// ─── Helper ──────────────────────────────────────────────────────────────────
 
 /// Smallest power of two ≥ n.
 fn next_power_of_two(n: usize) -> usize {
-    if n == 0 { 1 } else { n.next_power_of_two() }
+    if n == 0 {
+        1
+    } else {
+        n.next_power_of_two()
+    }
 }
 
 // ─── MerkleTree Implementation ───────────────────────────────────────────────
 
 impl MerkleTree {
-    /// Create a new, empty Merkle tree with standard Poseidon parameters.
+    /// Create a new, empty Merkle tree.
     pub fn new() -> Self {
         MerkleTree {
             leaves: Vec::new(),
             nodes: Vec::new(),
-            config: poseidon_config(),
         }
     }
 
-    /// Create a Merkle tree with a given Poseidon configuration.
-    pub fn with_config(config: PoseidonConfig<Fr>) -> Self {
-        MerkleTree {
-            leaves: Vec::new(),
-            nodes: Vec::new(),
-            config,
-        }
-    }
-
-    /// Return a reference to the Poseidon configuration used by this tree.
-    pub fn config(&self) -> &PoseidonConfig<Fr> {
-        &self.config
-    }
-
-    /// Insert a leaf (commitment) into the tree.
-    pub fn insert(&mut self, leaf: Fr) -> Result<usize, ProtocolError> {
+    /// Insert a leaf (commitment hash) into the tree.
+    ///
+    /// The leaf should be the output of `commitment_hash()` from the MLWE module.
+    pub fn insert(&mut self, leaf: [u8; 32]) -> Result<usize, ProtocolError> {
         let index = self.leaves.len();
         self.leaves.push(leaf);
         self.nodes.clear(); // invalidate cached tree
@@ -110,33 +123,28 @@ impl MerkleTree {
         let num_leaves = next_power_of_two(self.leaves.len());
         let total_nodes = 2 * num_leaves;
 
-        self.nodes = vec![Fr::zero(); total_nodes];
+        self.nodes = vec![ZERO_HASH; total_nodes];
 
         // Hash leaves into the second half of the array.
-        let zero_leaf = Fr::zero();
         for i in 0..num_leaves {
             let leaf_data = if i < self.leaves.len() {
                 &self.leaves[i]
             } else {
-                &zero_leaf
+                &ZERO_HASH
             };
-            self.nodes[num_leaves + i] = hash_leaf(&self.config, leaf_data);
+            self.nodes[num_leaves + i] = hash_leaf(leaf_data);
         }
 
         // Build internal nodes bottom-up.
         for i in (1..num_leaves).rev() {
-            self.nodes[i] = hash_node(
-                &self.config,
-                &self.nodes[2 * i],
-                &self.nodes[2 * i + 1],
-            );
+            self.nodes[i] = hash_node(&self.nodes[2 * i], &self.nodes[2 * i + 1]);
         }
 
         Ok(())
     }
 
-    /// Compute and return the Merkle root.
-    pub fn root(&mut self) -> Result<Fr, ProtocolError> {
+    /// Compute and return the Merkle root as a 32-byte hash.
+    pub fn root(&mut self) -> Result<[u8; 32], ProtocolError> {
         if self.leaves.is_empty() {
             return Err(ProtocolError::EmptyTree);
         }
@@ -200,16 +208,19 @@ impl MerkleTree {
     }
 
     /// Verify a Merkle inclusion proof (static utility).
-    pub fn verify_inclusion_proof(config: &PoseidonConfig<Fr>, proof: &MerkleProof) -> bool {
-        let mut current = hash_leaf(config, &proof.leaf);
+    ///
+    /// Recomputes the root from the leaf and sibling path, then checks
+    /// if it matches the claimed root in the proof.
+    pub fn verify_inclusion_proof(proof: &MerkleProof) -> bool {
+        let mut current = hash_leaf(&proof.leaf);
 
         for i in 0..proof.siblings.len() {
             if !proof.path_indices[i] {
                 // Current was left child.
-                current = hash_node(config, &current, &proof.siblings[i]);
+                current = hash_node(&current, &proof.siblings[i]);
             } else {
                 // Current was right child.
-                current = hash_node(config, &proof.siblings[i], &current);
+                current = hash_node(&proof.siblings[i], &current);
             }
         }
 
@@ -220,59 +231,66 @@ impl MerkleTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ark_ff::UniformRand;
+
+    fn random_leaf(seed: u8) -> [u8; 32] {
+        let mut leaf = [0u8; 32];
+        for i in 0..32 {
+            leaf[i] = seed.wrapping_add(i as u8);
+        }
+        leaf
+    }
 
     #[test]
     fn test_single_leaf_tree() {
         let mut tree = MerkleTree::new();
-        let mut rng = ark_std::test_rng();
-        let leaf = Fr::rand(&mut rng);
+        let leaf = random_leaf(1);
         tree.insert(leaf).unwrap();
 
         let root = tree.root().unwrap();
-        assert_ne!(root, Fr::zero());
+        assert_ne!(root, ZERO_HASH);
 
         let proof = tree.generate_inclusion_proof(0).unwrap();
-        assert!(MerkleTree::verify_inclusion_proof(tree.config(), &proof));
+        assert!(MerkleTree::verify_inclusion_proof(&proof));
     }
 
     #[test]
     fn test_multiple_leaves() {
         let mut tree = MerkleTree::new();
-        let mut rng = ark_std::test_rng();
-        for _ in 0..8 {
-            tree.insert(Fr::rand(&mut rng)).unwrap();
+        for i in 0..8 {
+            tree.insert(random_leaf(i)).unwrap();
         }
 
         for i in 0..8 {
             let proof = tree.generate_inclusion_proof(i).unwrap();
-            assert!(MerkleTree::verify_inclusion_proof(tree.config(), &proof));
+            assert!(
+                MerkleTree::verify_inclusion_proof(&proof),
+                "Proof for leaf {} failed",
+                i
+            );
         }
     }
 
     #[test]
     fn test_non_power_of_two_padding() {
         let mut tree = MerkleTree::new();
-        let mut rng = ark_std::test_rng();
-        for _ in 0..5 {
-            tree.insert(Fr::rand(&mut rng)).unwrap();
+        for i in 0..5 {
+            tree.insert(random_leaf(i + 10)).unwrap();
         }
 
         let proof = tree.generate_inclusion_proof(4).unwrap();
-        assert!(MerkleTree::verify_inclusion_proof(tree.config(), &proof));
+        assert!(MerkleTree::verify_inclusion_proof(&proof));
     }
 
     #[test]
     fn test_invalid_proof_detection() {
         let mut tree = MerkleTree::new();
-        let mut rng = ark_std::test_rng();
-        for _ in 0..4 {
-            tree.insert(Fr::rand(&mut rng)).unwrap();
+        for i in 0..4 {
+            tree.insert(random_leaf(i + 20)).unwrap();
         }
 
         let mut proof = tree.generate_inclusion_proof(0).unwrap();
-        proof.leaf = Fr::rand(&mut rng); // tamper
-        assert!(!MerkleTree::verify_inclusion_proof(tree.config(), &proof));
+        proof.leaf = random_leaf(99); // tamper
+        assert!(!MerkleTree::verify_inclusion_proof(&proof));
     }
 
     #[test]
@@ -284,11 +302,22 @@ mod tests {
     #[test]
     fn test_out_of_bounds_index() {
         let mut tree = MerkleTree::new();
-        let mut rng = ark_std::test_rng();
-        tree.insert(Fr::rand(&mut rng)).unwrap();
+        tree.insert(random_leaf(0)).unwrap();
         assert!(matches!(
             tree.generate_inclusion_proof(5),
             Err(ProtocolError::InvalidLeafIndex { .. })
         ));
+    }
+
+    #[test]
+    fn test_domain_separation() {
+        // A leaf hash and an internal node hash of the same data should differ.
+        let data = [42u8; 32];
+        let leaf_h = hash_leaf(&data);
+        let node_h = hash_node(&data, &data);
+        assert_ne!(
+            leaf_h, node_h,
+            "Leaf and node hashes of same data must differ (domain separation)"
+        );
     }
 }

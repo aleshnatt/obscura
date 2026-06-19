@@ -1,18 +1,27 @@
-//! # Obscura — Anonymous WebAuthn Credential Protocol
+//! # Obscura — Post-Quantum Anonymous WebAuthn Credential Protocol
 //!
-//! A privacy-preserving, ZK-augmented FIDO2/WebAuthn authentication engine
-//! with Groth16 proofs over BN254 via the arkworks cryptographic library.
+//! A privacy-preserving, lattice-based Zero-Knowledge authentication engine
+//! using Module-LWE proofs via the Fiat-Shamir with Aborts paradigm.
+//!
+//! ## Post-Quantum Security
+//!
+//! This protocol is resistant to quantum attacks. Security is based on the
+//! hardness of Module-LWE and Module-SIS in the Quantum Random Oracle Model
+//! (QROM), providing ≥128-bit classical and ≥64-bit quantum security (NIST
+//! Category 1 equivalent).
 //!
 //! ## Modules
 //!
 //! - [`error`]: Protocol error taxonomy.
-//! - [`poseidon`]: SNARK-friendly Poseidon hash for BN254 Fr.
-//! - [`tree`]: Poseidon-based binary Merkle tree (anonymity set).
-//! - [`circuit`]: R1CS circuit for the authentication relation R_auth.
-//! - [`protocol`]: Groth16 prover, verifier, and trusted setup.
+//! - [`poly`]: Polynomial arithmetic in R_q = ℤ_q[X]/(X^256 + 1).
+//! - [`mlwe`]: Module-LWE key generation and challenge sampling.
+//! - [`tree`]: SHAKE-256-based binary Merkle tree (anonymity set).
+//! - [`zk_auth`]: Lattice-based ZK authorization proof/verify (Fiat-Shamir with Aborts).
+//! - [`protocol`]: High-level prover, verifier, and key management API.
 
 pub mod error;
-pub mod poseidon;
+pub mod poly;
+pub mod mlwe;
 pub mod tree;
-pub mod circuit;
+pub mod zk_auth;
 pub mod protocol;

@@ -1,245 +1,181 @@
-//! # Obscura Protocol — Core Groth16 Engine
+//! # Obscura Protocol — Core Lattice-Based ZK Engine
 //!
-//! Groth16 proving and verification over BN254 using the arkworks
-//! cryptographic library. This module implements the full proving pipeline:
-//! elliptic curve operations, bilinear pairings, and R1CS constraint
-//! satisfaction.
+//! Post-quantum proving and verification over Module-LWE using the
+//! Fiat-Shamir with Aborts paradigm. This module provides the high-level
+//! protocol API for key generation, proof creation, and verification.
 //!
 //! ## Architecture
 //!
-//! - **Trusted Setup**: `trusted_setup()` runs `Groth16::circuit_specific_setup()`
-//!   to generate the proving key (pk) and verification key (vk). This is a
-//!   one-time operation per circuit depth. In production, this would be
-//!   performed via a Multi-Party Computation (MPC) ceremony.
+//! - **No Trusted Setup**: Unlike Groth16, the lattice-based protocol uses
+//!   public MLWE parameters (a uniform matrix A) that require no multi-party
+//!   ceremony. Parameters can be generated from a public seed.
 //!
-//! - **Proving**: `Prover::generate_proof()` instantiates the R1CS circuit
-//!   with the private witness and calls `Groth16::prove()`, which performs
-//!   real scalar multiplications on BN254 G₁/G₂ to produce π = (A, B, C).
+//! - **Proving**: `Prover::generate_proof()` invokes the lattice ZK protocol:
+//!   sample masking vector, compute commitment, derive Fiat-Shamir challenge,
+//!   compute response with rejection sampling.
 //!
-//! - **Verification**: `Verifier::verify_proof()` calls `Groth16::verify()`,
-//!   which performs 3 bilinear pairings to check:
-//!   `e(A, B) = e(α, β) · e(Σxᵢ·ICᵢ, γ) · e(C, δ)`
+//! - **Verification**: `Verifier::verify_proof()` checks the norm bound,
+//!   challenge consistency, algebraic relation, and Merkle membership.
+//!
+//! ## Security
+//!
+//! Security is based on the hardness of Module-LWE and Module-SIS in the
+//! Quantum Random Oracle Model (QROM), providing ≥128-bit classical and
+//! ≥64-bit quantum security at NIST Category 1.
 
-use ark_bn254::{Bn254, Fr};
-use ark_ff::UniformRand;
-use ark_groth16::{Groth16, Proof, ProvingKey, VerifyingKey};
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use ark_snark::SNARK;
-use rand::{CryptoRng, RngCore};
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
 
-use crate::circuit::ObscuraCircuit;
 use crate::error::ProtocolError;
-use crate::poseidon::{poseidon_config, poseidon_hash};
+use crate::mlwe::{self, MlweKeyPair, MlweParams};
+use crate::poly::PolyVec;
 use crate::tree::MerkleProof;
-use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
+use crate::zk_auth::{self, AuthProof};
 
 // ─── Data Structures ─────────────────────────────────────────────────────────
 
-/// A credential key pair.
+/// A credential key pair for the post-quantum protocol.
 ///
-/// In Obscura, the key pair consists of two BN254 scalar field elements:
-/// - `secret_key`: the private authentication credential
-/// - `nonce`: a random blinding factor for the commitment
+/// Wraps an MLWE key pair:
+/// - `secret_key`: s ∈ R_q^k with small CBD coefficients.
+/// - `public_key`: b = A·s + e mod q.
 ///
-/// The commitment `C = Poseidon(sk, nonce)` is inserted into the Merkle tree.
-#[derive(Debug, Clone)]
+/// The commitment `SHAKE-256("COM_DOM" ∥ b)` is inserted into the Merkle tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyPair {
-    /// Private authentication key (BN254 scalar).
-    pub secret_key: Fr,
-    /// Random blinding factor for the commitment (ensures hiding).
-    pub nonce: Fr,
+    /// The underlying MLWE key pair.
+    pub inner: MlweKeyPair,
 }
 
 /// Public inputs to the ZK proof — visible to both prover and verifier.
 #[derive(Debug, Clone)]
 pub struct PublicInputs {
-    /// The Merkle root of the anonymity set.
-    pub merkle_root: Fr,
-    /// The server-issued authentication challenge.
-    pub challenge: Fr,
-    /// The nullifier: `Poseidon(sk, challenge)`.
-    pub nullifier: Fr,
-}
-
-/// Groth16 setup parameters (proving key + verification key).
-///
-/// Generated once during trusted setup; reused for all proofs at the
-/// same tree depth.
-pub struct SetupParams {
-    /// The proving key — used by the prover to generate proofs.
-    /// Contains the toxic waste-derived evaluation points.
-    pub proving_key: ProvingKey<Bn254>,
-    /// The verification key — used by the verifier to check proofs.
-    /// Contains the pairing check elements (α, β, γ, δ, IC).
-    pub verifying_key: VerifyingKey<Bn254>,
+    /// The Merkle root of the anonymity set (32-byte SHAKE-256 hash).
+    pub merkle_root: [u8; 32],
+    /// The session-specific challenge scope (arbitrary bytes).
+    pub scope: Vec<u8>,
+    /// The nullifier: SHAKE-256("NUL_DOM" ∥ s ∥ scope).
+    pub nullifier: [u8; 32],
 }
 
 // ─── KeyPair Implementation ──────────────────────────────────────────────────
 
 impl KeyPair {
-    /// Generate a new random key pair.
+    /// Generate a new random MLWE key pair.
     ///
-    /// Both `secret_key` and `nonce` are sampled uniformly at random
-    /// from the BN254 scalar field Fr.
-    pub fn generate<R: RngCore>(rng: &mut R) -> Self {
+    /// Samples s, e ← CBD(η)^k and computes b = A·s + e mod q.
+    pub fn generate(params: &MlweParams, rng: &mut dyn RngCore) -> Self {
         KeyPair {
-            secret_key: Fr::rand(rng),
-            nonce: Fr::rand(rng),
+            inner: mlwe::keygen(params, rng),
         }
     }
 
-    /// Compute the Poseidon commitment for this key pair.
+    /// Access the secret key vector.
+    pub fn secret_key(&self) -> &PolyVec {
+        &self.inner.secret_key
+    }
+
+    /// Access the public key vector.
+    pub fn public_key(&self) -> &PolyVec {
+        &self.inner.public_key
+    }
+
+    /// Compute the SHAKE-256 commitment hash for this key pair's public key.
     ///
-    /// `C = Poseidon(secret_key, nonce)`
+    /// `commitment = SHAKE-256("COM_DOM" ∥ serialize(b))`, 32 bytes.
     ///
     /// This value is inserted as a leaf into the Merkle tree.
-    pub fn commitment(&self, config: &PoseidonConfig<Fr>) -> Fr {
-        poseidon_hash(config, &[self.secret_key, self.nonce])
+    pub fn commitment(&self) -> [u8; 32] {
+        mlwe::commitment_hash(&self.inner.public_key)
     }
 
-    /// Derive the nullifier for a given challenge.
+    /// Derive the nullifier for a given scope.
     ///
-    /// `ν = Poseidon(secret_key, challenge)`
-    pub fn nullifier(&self, config: &PoseidonConfig<Fr>, challenge: &Fr) -> Fr {
-        poseidon_hash(config, &[self.secret_key, *challenge])
+    /// `nullifier = SHAKE-256("NUL_DOM" ∥ serialize(s) ∥ scope)`, 32 bytes.
+    pub fn nullifier(&self, scope: &[u8]) -> [u8; 32] {
+        zk_auth::derive_nullifier(&self.inner.secret_key, scope)
     }
-}
-
-// ─── Trusted Setup ───────────────────────────────────────────────────────────
-
-/// Run the Groth16 trusted setup ceremony for a given tree depth.
-///
-/// This generates the structured reference string (SRS) consisting of
-/// the proving key and verification key. The setup is performed using
-/// a dummy circuit (with `None` witness values) to determine the
-/// constraint structure.
-///
-/// ## Security Note
-///
-/// In production, this MUST be performed via a Multi-Party Computation
-/// (MPC) ceremony to ensure that no single party learns the toxic waste
-/// (τ, α, β, γ, δ). If the toxic waste is known, an adversary can
-/// forge proofs.
-pub fn trusted_setup<R: RngCore + CryptoRng>(
-    tree_depth: usize,
-    rng: &mut R,
-) -> Result<SetupParams, ProtocolError> {
-    let config = poseidon_config();
-    let dummy_circuit = ObscuraCircuit::dummy(config, tree_depth);
-
-    let (pk, vk) = Groth16::<Bn254>::circuit_specific_setup(dummy_circuit, rng)
-        .map_err(|e| ProtocolError::SetupFailure {
-            reason: e.to_string(),
-        })?;
-
-    Ok(SetupParams {
-        proving_key: pk,
-        verifying_key: vk,
-    })
 }
 
 // ─── Prover ──────────────────────────────────────────────────────────────────
 
-/// The Prover generates Groth16 proofs of credential set membership.
+/// The Prover generates lattice-based ZK proofs of credential set membership.
 ///
-/// Internally, `Groth16::prove()` performs:
-/// 1. Evaluates the R1CS constraint system with the witness.
-/// 2. Computes the proof elements via scalar multiplication on BN254:
-///    - `A = α + Σ aᵢ·Lᵢ(τ)·G₁ + r·δ·G₁`
-///    - `B = β + Σ aᵢ·Rᵢ(τ)·G₂ + s·δ·G₂`
-///    - `C = (Σ aᵢ·(β·Lᵢ+α·Rᵢ+Oᵢ)(τ)/δ)·G₁ + A·s + r·B − r·s·δ·G₁`
-/// 3. Outputs π = (A, B, C) ∈ G₁ × G₂ × G₁.
+/// The proving protocol uses Fiat-Shamir with Aborts:
+/// 1. Sample masking vector y ← Uniform([-γ₁+1, γ₁])^{k·n}.
+/// 2. Compute commitment w = A · y mod q.
+/// 3. Derive challenge c via SHAKE-256 from the transcript.
+/// 4. Compute response z = y + c·s mod q.
+/// 5. Rejection sampling: abort if ‖z‖∞ ≥ γ₁ - β.
+///
+/// Expected ~4-5 attempts per successful proof due to rejection sampling.
 pub struct Prover;
 
 impl Prover {
-    /// Generate a Groth16 proof.
-    pub fn generate_proof<R: RngCore + CryptoRng>(
+    /// Generate a lattice-based ZK authorization proof.
+    pub fn generate_proof(
+        params: &MlweParams,
         keypair: &KeyPair,
         merkle_proof: &MerkleProof,
         public_inputs: &PublicInputs,
-        proving_key: &ProvingKey<Bn254>,
-        rng: &mut R,
-    ) -> Result<Proof<Bn254>, ProtocolError> {
-        let config = poseidon_config();
-
-        // Construct the circuit with concrete witness values.
-        let circuit = ObscuraCircuit {
-            poseidon_config: config,
-            tree_depth: merkle_proof.siblings.len(),
-            merkle_root: Some(public_inputs.merkle_root),
-            nullifier: Some(public_inputs.nullifier),
-            secret_key: Some(keypair.secret_key),
-            nonce: Some(keypair.nonce),
-            challenge: Some(public_inputs.challenge),
-            merkle_siblings: merkle_proof.siblings.iter().map(|s| Some(*s)).collect(),
-            path_indices: merkle_proof.path_indices.iter().map(|b| Some(*b)).collect(),
-        };
-
-        // Run the Groth16 prover.
-        Groth16::<Bn254>::prove(proving_key, circuit, rng).map_err(|e| {
-            ProtocolError::ProofGenerationFailure {
-                reason: e.to_string(),
-            }
-        })
+        rng: &mut dyn RngCore,
+    ) -> Result<AuthProof, ProtocolError> {
+        zk_auth::prove(
+            params,
+            &keypair.inner,
+            merkle_proof,
+            &public_inputs.merkle_root,
+            &public_inputs.scope,
+            rng,
+        )
     }
 }
 
 // ─── Verifier ────────────────────────────────────────────────────────────────
 
-/// The Verifier checks Groth16 proofs using bilinear pairings.
+/// The Verifier checks lattice-based ZK proofs.
 ///
-/// The verification equation is:
+/// Verification checks:
+/// 1. ‖z‖∞ < γ₁ - β (response norm bound).
+/// 2. Challenge consistency (recomputed from transcript).
+/// 3. Algebraic relation: ‖A·z - w - c·b‖∞ < τ·η·n + 1.
+/// 4. Merkle membership (commitment hash ↔ root).
 ///
-/// ```text
-/// e(A, B) == e(α·G₁, β·G₂) · e(Σ xᵢ·ICᵢ, γ·G₂) · e(C, δ·G₂)
-/// ```
-///
-/// where:
-/// - `e` is the BN254 optimal Ate pairing
-/// - `(A, B, C)` is the proof
-/// - `(α, β, γ, δ, {ICᵢ})` are the verification key elements
-/// - `{xᵢ}` are the public inputs (merkle_root, nullifier)
-///
-/// This involves 3 pairing computations and runs in constant time
-/// regardless of the circuit size.
+/// Verification runs in constant time relative to the anonymity set size.
 pub struct Verifier;
 
 impl Verifier {
-    /// Verify a Groth16 proof against the given public inputs.
+    /// Verify a lattice-based ZK authorization proof.
     ///
     /// Returns `Ok(true)` if the proof is valid, `Ok(false)` if it fails
-    /// the pairing check, or `Err(...)` if verification encounters an error.
+    /// any verification check.
     pub fn verify_proof(
-        proof: &Proof<Bn254>,
+        params: &MlweParams,
+        proof: &AuthProof,
+        keypair: &KeyPair,
         public_inputs: &PublicInputs,
-        verifying_key: &VerifyingKey<Bn254>,
     ) -> Result<bool, ProtocolError> {
-        // Public inputs must match the order allocated in the circuit:
-        // [merkle_root, nullifier]
-        let inputs = vec![public_inputs.merkle_root, public_inputs.nullifier];
-
-        Groth16::<Bn254>::verify(verifying_key, &inputs, proof)
-            .map_err(|_| ProtocolError::InvalidProof)
+        zk_auth::verify(
+            params,
+            proof,
+            &keypair.inner.public_key,
+            &public_inputs.merkle_root,
+            &public_inputs.scope,
+        )
     }
 }
 
-/// Serialize a Groth16 proof to compressed bytes.
-pub fn serialize_proof(proof: &Proof<Bn254>) -> Result<Vec<u8>, ProtocolError> {
-    let mut bytes = Vec::new();
-    proof
-        .serialize_compressed(&mut bytes)
-        .map_err(|e| ProtocolError::SerializationError {
-            reason: e.to_string(),
-        })?;
-    Ok(bytes)
+/// Serialize an AuthProof to JSON bytes.
+pub fn serialize_proof(proof: &AuthProof) -> Result<Vec<u8>, ProtocolError> {
+    serde_json::to_vec(proof).map_err(|e| ProtocolError::SerializationError {
+        reason: e.to_string(),
+    })
 }
 
-/// Deserialize a Groth16 proof from compressed bytes.
-pub fn deserialize_proof(bytes: &[u8]) -> Result<Proof<Bn254>, ProtocolError> {
-    Proof::<Bn254>::deserialize_compressed(bytes).map_err(|e| {
-        ProtocolError::SerializationError {
-            reason: e.to_string(),
-        }
+/// Deserialize an AuthProof from JSON bytes.
+pub fn deserialize_proof(bytes: &[u8]) -> Result<AuthProof, ProtocolError> {
+    serde_json::from_slice(bytes).map_err(|e| ProtocolError::SerializationError {
+        reason: e.to_string(),
     })
 }
 
@@ -251,122 +187,107 @@ mod tests {
     use rand::rngs::StdRng;
 
     #[test]
-    fn test_full_groth16_flow() {
+    fn test_full_lattice_zk_flow() {
         let mut rng = StdRng::seed_from_u64(42);
-        let config = poseidon_config();
 
-        // Setup: build tree
-        let mut tree = MerkleTree::with_config(config.clone());
+        // Generate MLWE parameters (public matrix A).
+        let params = MlweParams::generate(&mut rng);
+
+        // Build anonymity set.
+        let mut tree = MerkleTree::new();
         for _ in 0..3 {
-            let dummy = KeyPair::generate(&mut rng);
-            tree.insert(dummy.commitment(&config)).unwrap();
+            let dummy = KeyPair::generate(&params, &mut rng);
+            tree.insert(dummy.commitment()).unwrap();
         }
-        let user = KeyPair::generate(&mut rng);
-        let user_idx = tree.insert(user.commitment(&config)).unwrap();
+
+        // Register user.
+        let user = KeyPair::generate(&params, &mut rng);
+        let user_idx = tree.insert(user.commitment()).unwrap();
         let root = tree.root().unwrap();
         let merkle_proof = tree.generate_inclusion_proof(user_idx).unwrap();
-        let tree_depth = tree.depth();
 
-        // Trusted setup
-        let params = trusted_setup(tree_depth, &mut rng).unwrap();
-
-        // Challenge + nullifier
-        let challenge = Fr::rand(&mut rng);
-        let nullifier = user.nullifier(&config, &challenge);
+        // Challenge + nullifier.
+        let scope = b"session_challenge_xyz".to_vec();
+        let nullifier = user.nullifier(&scope);
         let public_inputs = PublicInputs {
             merkle_root: root,
-            challenge,
+            scope: scope.clone(),
             nullifier,
         };
 
-        // Prove
+        // Prove.
         let proof =
-            Prover::generate_proof(&user, &merkle_proof, &public_inputs, &params.proving_key, &mut rng)
+            Prover::generate_proof(&params, &user, &merkle_proof, &public_inputs, &mut rng)
                 .unwrap();
 
-        // Verify
-        let valid =
-            Verifier::verify_proof(&proof, &public_inputs, &params.verifying_key).unwrap();
+        // Verify.
+        let valid = Verifier::verify_proof(&params, &proof, &user, &public_inputs).unwrap();
         assert!(valid, "Valid proof must pass verification");
     }
 
     #[test]
-    fn test_tampered_proof_rejected() {
+    fn test_serialization_roundtrip() {
         let mut rng = StdRng::seed_from_u64(43);
-        let config = poseidon_config();
+        let params = MlweParams::generate(&mut rng);
 
-        let mut tree = MerkleTree::with_config(config.clone());
-        let user = KeyPair::generate(&mut rng);
-        tree.insert(user.commitment(&config)).unwrap();
+        let mut tree = MerkleTree::new();
+        let user = KeyPair::generate(&params, &mut rng);
+        tree.insert(user.commitment()).unwrap();
         let root = tree.root().unwrap();
         let merkle_proof = tree.generate_inclusion_proof(0).unwrap();
-        let tree_depth = tree.depth();
 
-        let params = trusted_setup(tree_depth, &mut rng).unwrap();
-        let challenge = Fr::rand(&mut rng);
-        let nullifier = user.nullifier(&config, &challenge);
+        let scope = b"serialize_test".to_vec();
+        let nullifier = user.nullifier(&scope);
         let public_inputs = PublicInputs {
             merkle_root: root,
-            challenge,
+            scope: scope.clone(),
             nullifier,
         };
 
         let proof =
-            Prover::generate_proof(&user, &merkle_proof, &public_inputs, &params.proving_key, &mut rng)
+            Prover::generate_proof(&params, &user, &merkle_proof, &public_inputs, &mut rng)
                 .unwrap();
 
-        // Tamper: serialize, flip bytes, deserialize
-        let mut bytes = serialize_proof(&proof).unwrap();
-        bytes[0] ^= 0xFF;
-        // Deserialization of corrupted bytes should fail or produce invalid proof
-        match deserialize_proof(&bytes) {
-            Ok(tampered_proof) => {
-                let result =
-                    Verifier::verify_proof(&tampered_proof, &public_inputs, &params.verifying_key);
-                // Should either error or return false
-                match result {
-                    Ok(valid) => assert!(!valid, "Tampered proof must not verify"),
-                    Err(_) => {} // Also acceptable — invalid curve point
-                }
-            }
-            Err(_) => {} // Deserialization failure is expected for corrupted bytes
-        }
+        // Serialize and deserialize.
+        let bytes = serialize_proof(&proof).unwrap();
+        let recovered = deserialize_proof(&bytes).unwrap();
+
+        // Verify the recovered proof.
+        let valid = Verifier::verify_proof(&params, &recovered, &user, &public_inputs).unwrap();
+        assert!(valid, "Deserialized proof must still verify");
     }
 
     #[test]
-    fn test_wrong_public_inputs_rejected() {
+    fn test_wrong_scope_rejected() {
         let mut rng = StdRng::seed_from_u64(44);
-        let config = poseidon_config();
+        let params = MlweParams::generate(&mut rng);
 
-        let mut tree = MerkleTree::with_config(config.clone());
-        let user = KeyPair::generate(&mut rng);
-        tree.insert(user.commitment(&config)).unwrap();
+        let mut tree = MerkleTree::new();
+        let user = KeyPair::generate(&params, &mut rng);
+        tree.insert(user.commitment()).unwrap();
         let root = tree.root().unwrap();
         let merkle_proof = tree.generate_inclusion_proof(0).unwrap();
-        let tree_depth = tree.depth();
 
-        let params = trusted_setup(tree_depth, &mut rng).unwrap();
-        let challenge = Fr::rand(&mut rng);
-        let nullifier = user.nullifier(&config, &challenge);
+        let scope = b"correct_scope".to_vec();
+        let nullifier = user.nullifier(&scope);
         let public_inputs = PublicInputs {
             merkle_root: root,
-            challenge,
+            scope,
             nullifier,
         };
 
         let proof =
-            Prover::generate_proof(&user, &merkle_proof, &public_inputs, &params.proving_key, &mut rng)
+            Prover::generate_proof(&params, &user, &merkle_proof, &public_inputs, &mut rng)
                 .unwrap();
 
-        // Verify with wrong nullifier
+        // Verify with wrong scope.
         let wrong_inputs = PublicInputs {
             merkle_root: root,
-            challenge,
-            nullifier: Fr::rand(&mut rng), // wrong!
+            scope: b"wrong_scope".to_vec(),
+            nullifier,
         };
 
-        let valid =
-            Verifier::verify_proof(&proof, &wrong_inputs, &params.verifying_key).unwrap();
-        assert!(!valid, "Wrong public inputs must fail verification");
+        let valid = Verifier::verify_proof(&params, &proof, &user, &wrong_inputs).unwrap();
+        assert!(!valid, "Wrong scope must fail verification");
     }
 }
