@@ -2,7 +2,7 @@
 //!
 //! Implements polynomial arithmetic in the ring:
 //!
-//!   R_q = ℤ_q[X] / (X^256 + 1)
+//!   R_q = Z_q\[X\] / (X^256 + 1)
 //!
 //! with parameters:
 //! - Ring dimension n = 256
@@ -20,8 +20,9 @@
 //! modulo X^256 + 1 (negacyclic convolution). All arithmetic is
 //! performed with signed intermediate values and reduced to [0, q).
 
-use rand::RngCore;
+use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -52,10 +53,10 @@ pub const BETA: i64 = (TAU as i64) * (ETA as i64) * 2;
 
 // ─── Polynomial ──────────────────────────────────────────────────────────────
 
-/// A polynomial in R_q = ℤ_q[X]/(X^256 + 1).
+/// A polynomial in R_q = Z_q\[X\]/(X^256 + 1).
 ///
 /// Coefficients are stored in standard (non-NTT) form as values in [0, q).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize)]
 pub struct Poly {
     /// 256 coefficients representing a₀ + a₁X + a₂X² + ... + a₂₅₅X²⁵⁵.
     pub coeffs: [i64; N],
@@ -137,7 +138,7 @@ impl Poly {
         result
     }
 
-    /// Multiply two polynomials in R_q = ℤ_q[X]/(X^256 + 1).
+    /// Multiply two polynomials in R_q = Z_q\[X\]/(X^256 + 1).
     ///
     /// Uses schoolbook multiplication with negacyclic reduction:
     /// X^256 ≡ -1, so if the product coefficient index ≥ N,
@@ -165,8 +166,8 @@ impl Poly {
         }
 
         let mut out = Poly::zero();
-        for i in 0..N {
-            out.coeffs[i] = (result[i].rem_euclid(Q as i128)) as i64;
+        for (out_coeff, value) in out.coeffs.iter_mut().zip(result) {
+            *out_coeff = (value.rem_euclid(Q as i128)) as i64;
         }
         out
     }
@@ -177,7 +178,7 @@ impl Poly {
     /// For each coefficient: sample 2η uniform bits, split into two halves,
     /// compute (popcount(first_half) - popcount(second_half)).
     /// Result is in [-η, η] = [-2, 2].
-    pub fn sample_cbd(rng: &mut dyn RngCore) -> Poly {
+    pub fn sample_cbd<R: RngCore + CryptoRng + ?Sized>(rng: &mut R) -> Poly {
         let mut poly = Poly::zero();
         // For η=2, we need 2*η = 4 bits per coefficient, so 4*256 = 1024 bits = 128 bytes.
         let mut bytes = [0u8; 128];
@@ -211,7 +212,7 @@ impl Poly {
     }
 
     /// Sample a polynomial with coefficients uniformly in [0, q).
-    pub fn sample_uniform(rng: &mut dyn RngCore) -> Poly {
+    pub fn sample_uniform<R: RngCore + CryptoRng + ?Sized>(rng: &mut R) -> Poly {
         let mut poly = Poly::zero();
         for c in poly.coeffs.iter_mut() {
             loop {
@@ -230,7 +231,7 @@ impl Poly {
     /// Sample a masking polynomial with coefficients uniform in [-γ₁+1, γ₁].
     ///
     /// The range has width 2·γ₁ = 262,144 values.
-    pub fn sample_masking(rng: &mut dyn RngCore) -> Poly {
+    pub fn sample_masking<R: RngCore + CryptoRng + ?Sized>(rng: &mut R) -> Poly {
         let mut poly = Poly::zero();
         let range = 2 * GAMMA1; // 262,144
         for c in poly.coeffs.iter_mut() {
@@ -264,7 +265,7 @@ impl Poly {
 
     /// Deserialize polynomial from bytes (little-endian, 3 bytes per coefficient).
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < N * 3 {
+        if bytes.len() != N * 3 {
             return None;
         }
         let mut poly = Poly::zero();
@@ -285,8 +286,9 @@ impl Poly {
 // ─── Polynomial Vector ───────────────────────────────────────────────────────
 
 /// A vector of k polynomials in R_q^k.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize)]
 pub struct PolyVec {
+    /// Component polynomials.
     pub polys: Vec<Poly>,
 }
 
@@ -331,7 +333,7 @@ impl PolyVec {
         }
     }
 
-    /// Inner product of two vectors: Σᵢ self[i] · other[i].
+    /// Inner product of two vectors: `sum_i self[i] * other[i]`.
     pub fn inner_product(&self, other: &PolyVec) -> Poly {
         assert_eq!(self.polys.len(), other.polys.len());
         let mut result = Poly::zero();
@@ -343,25 +345,29 @@ impl PolyVec {
 
     /// Maximum infinity norm across all component polynomials.
     pub fn infinity_norm(&self) -> i64 {
-        self.polys.iter().map(|p| p.infinity_norm()).max().unwrap_or(0)
+        self.polys
+            .iter()
+            .map(|p| p.infinity_norm())
+            .max()
+            .unwrap_or(0)
     }
 
     /// Sample a uniform random polynomial vector.
-    pub fn sample_uniform(rng: &mut dyn RngCore) -> PolyVec {
+    pub fn sample_uniform<R: RngCore + CryptoRng + ?Sized>(rng: &mut R) -> PolyVec {
         PolyVec {
             polys: (0..K).map(|_| Poly::sample_uniform(rng)).collect(),
         }
     }
 
     /// Sample a CBD polynomial vector.
-    pub fn sample_cbd(rng: &mut dyn RngCore) -> PolyVec {
+    pub fn sample_cbd<R: RngCore + CryptoRng + ?Sized>(rng: &mut R) -> PolyVec {
         PolyVec {
             polys: (0..K).map(|_| Poly::sample_cbd(rng)).collect(),
         }
     }
 
     /// Sample a masking polynomial vector.
-    pub fn sample_masking(rng: &mut dyn RngCore) -> PolyVec {
+    pub fn sample_masking<R: RngCore + CryptoRng + ?Sized>(rng: &mut R) -> PolyVec {
         PolyVec {
             polys: (0..K).map(|_| Poly::sample_masking(rng)).collect(),
         }
@@ -379,7 +385,7 @@ impl PolyVec {
     /// Deserialize from bytes.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let poly_size = N * 3;
-        if bytes.len() < K * poly_size {
+        if bytes.len() != K * poly_size {
             return None;
         }
         let mut polys = Vec::with_capacity(K);
@@ -397,13 +403,13 @@ impl PolyVec {
 /// A k × k matrix of polynomials in R_q^{k×k}.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolyMat {
-    /// Rows of the matrix. rows[i] is the i-th row vector.
+    /// Rows of the matrix. `rows[i]` is the i-th row vector.
     pub rows: Vec<PolyVec>,
 }
 
 impl PolyMat {
     /// Generate a uniform random k × k polynomial matrix.
-    pub fn sample_uniform(rng: &mut dyn RngCore) -> PolyMat {
+    pub fn sample_uniform<R: RngCore + CryptoRng + ?Sized>(rng: &mut R) -> PolyMat {
         PolyMat {
             rows: (0..K).map(|_| PolyVec::sample_uniform(rng)).collect(),
         }
@@ -411,15 +417,11 @@ impl PolyMat {
 
     /// Matrix-vector product: A · v, where A is k×k and v is k×1.
     ///
-    /// Returns a k×1 polynomial vector where result[i] = Σⱼ A[i][j] · v[j].
+    /// Returns a k-by-1 polynomial vector where `result[i] = sum_j A[i][j] * v[j]`.
     pub fn mul_vec(&self, v: &PolyVec) -> PolyVec {
         assert_eq!(self.rows.len(), K);
         PolyVec {
-            polys: self
-                .rows
-                .iter()
-                .map(|row| row.inner_product(v))
-                .collect(),
+            polys: self.rows.iter().map(|row| row.inner_product(v)).collect(),
         }
     }
 }

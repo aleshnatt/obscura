@@ -1,5 +1,5 @@
 /target/
+.internal/
 **/*.rs.bk
-
-/whitepaper/
 *.sh
+.DS_Store

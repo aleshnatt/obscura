@@ -1,24 +1,20 @@
 [package]
 name = "obscura"
-version = "1.0.0"
+version = "0.1.0"
 edition = "2024"
 authors = ["Naufal Ziyaadaturrahman"]
-description = "Obscura: Post-Quantum Anonymous WebAuthn Credential Protocol — A privacy-preserving, lattice-based ZK authentication engine with Module-LWE proofs via Fiat-Shamir with Aborts."
+description = "Lattice-based credential authorization with Module-LWE-style proofs and SHAKE-256 Merkle membership."
 license = "MIT"
+readme = "README.md"
 repository = "https://github.com/aleshnatt/obscura"
-keywords = ["webauthn", "fido2", "zero-knowledge", "privacy", "post-quantum"]
+keywords = ["webauthn", "fido2", "zero-knowledge", "privacy", "lattice"]
 categories = ["cryptography", "authentication"]
+exclude = [".DS_Store"]
 
 [dependencies]
-# Post-quantum cryptographic hash (SHAKE-256)
 sha3 = "0.10"
-
-# Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
-# Utilities
 rand = "0.8"
 thiserror = "1.0"
-hex = "0.4"
-clap = { version = "4.0", features = ["derive"] }
+zeroize = { version = "1.8", features = ["derive"] }

@@ -19,8 +19,8 @@
 //!   2-to-1 hash with its own domain separator.
 
 use serde::{Deserialize, Serialize};
-use sha3::digest::{ExtendableOutput, Update, XofReader};
 use sha3::Shake256;
+use sha3::digest::{ExtendableOutput, Update, XofReader};
 
 use crate::error::ProtocolError;
 
@@ -86,11 +86,7 @@ pub struct MerkleProof {
 
 /// Smallest power of two ≥ n.
 fn next_power_of_two(n: usize) -> usize {
-    if n == 0 {
-        1
-    } else {
-        n.next_power_of_two()
-    }
+    if n == 0 { 1 } else { n.next_power_of_two() }
 }
 
 // ─── MerkleTree Implementation ───────────────────────────────────────────────
@@ -159,8 +155,7 @@ impl MerkleTree {
         if self.leaves.is_empty() {
             return 0;
         }
-        let num_leaves = next_power_of_two(self.leaves.len());
-        (num_leaves as f64).log2() as usize
+        next_power_of_two(self.leaves.len()).trailing_zeros() as usize
     }
 
     /// Generate a Merkle inclusion proof for the leaf at `leaf_index`.
@@ -180,21 +175,21 @@ impl MerkleTree {
         }
 
         let num_leaves = next_power_of_two(self.leaves.len());
-        let depth = (num_leaves as f64).log2() as usize;
+        let depth = num_leaves.trailing_zeros() as usize;
 
         let mut siblings = Vec::with_capacity(depth);
         let mut path_indices = Vec::with_capacity(depth);
         let mut current_index = num_leaves + leaf_index;
 
         for _ in 0..depth {
-            let sibling_index = if current_index % 2 == 0 {
+            let sibling_index = if current_index.is_multiple_of(2) {
                 current_index + 1
             } else {
                 current_index - 1
             };
 
             siblings.push(self.nodes[sibling_index]);
-            path_indices.push(current_index % 2 != 0); // true if right child
+            path_indices.push(!current_index.is_multiple_of(2)); // true if right child
 
             current_index /= 2;
         }
@@ -212,19 +207,29 @@ impl MerkleTree {
     /// Recomputes the root from the leaf and sibling path, then checks
     /// if it matches the claimed root in the proof.
     pub fn verify_inclusion_proof(proof: &MerkleProof) -> bool {
+        if proof.siblings.len() != proof.path_indices.len() {
+            return false;
+        }
+
         let mut current = hash_leaf(&proof.leaf);
 
-        for i in 0..proof.siblings.len() {
-            if !proof.path_indices[i] {
+        for (sibling, is_right_child) in proof.siblings.iter().zip(&proof.path_indices) {
+            if !is_right_child {
                 // Current was left child.
-                current = hash_node(&current, &proof.siblings[i]);
+                current = hash_node(&current, sibling);
             } else {
                 // Current was right child.
-                current = hash_node(&proof.siblings[i], &current);
+                current = hash_node(sibling, &current);
             }
         }
 
         current == proof.root
+    }
+}
+
+impl Default for MerkleTree {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -234,8 +239,8 @@ mod tests {
 
     fn random_leaf(seed: u8) -> [u8; 32] {
         let mut leaf = [0u8; 32];
-        for i in 0..32 {
-            leaf[i] = seed.wrapping_add(i as u8);
+        for (i, byte) in leaf.iter_mut().enumerate() {
+            *byte = seed.wrapping_add(i as u8);
         }
         leaf
     }
@@ -290,6 +295,19 @@ mod tests {
 
         let mut proof = tree.generate_inclusion_proof(0).unwrap();
         proof.leaf = random_leaf(99); // tamper
+        assert!(!MerkleTree::verify_inclusion_proof(&proof));
+    }
+
+    #[test]
+    fn test_malformed_proof_lengths_rejected() {
+        let mut tree = MerkleTree::new();
+        for i in 0..4 {
+            tree.insert(random_leaf(i + 30)).unwrap();
+        }
+
+        let mut proof = tree.generate_inclusion_proof(0).unwrap();
+        proof.path_indices.pop();
+
         assert!(!MerkleTree::verify_inclusion_proof(&proof));
     }
 

@@ -17,14 +17,9 @@
 //! - **Verification**: `Verifier::verify_proof()` checks the norm bound,
 //!   challenge consistency, algebraic relation, and Merkle membership.
 //!
-//! ## Security
-//!
-//! Security is based on the hardness of Module-LWE and Module-SIS in the
-//! Quantum Random Oracle Model (QROM), providing ≥128-bit classical and
-//! ≥64-bit quantum security at NIST Category 1.
+use std::fmt;
 
-use rand::RngCore;
-use serde::{Deserialize, Serialize};
+use rand::{CryptoRng, RngCore};
 
 use crate::error::ProtocolError;
 use crate::mlwe::{self, MlweKeyPair, MlweParams};
@@ -41,10 +36,18 @@ use crate::zk_auth::{self, AuthProof};
 /// - `public_key`: b = A·s + e mod q.
 ///
 /// The commitment `SHAKE-256("COM_DOM" ∥ b)` is inserted into the Merkle tree.
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyPair {
     /// The underlying MLWE key pair.
-    pub inner: MlweKeyPair,
+    pub(crate) inner: MlweKeyPair,
+}
+
+impl fmt::Debug for KeyPair {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyPair")
+            .field("public_key", &self.inner.public_key)
+            .field("secret_key", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Public inputs to the ZK proof — visible to both prover and verifier.
@@ -64,7 +67,7 @@ impl KeyPair {
     /// Generate a new random MLWE key pair.
     ///
     /// Samples s, e ← CBD(η)^k and computes b = A·s + e mod q.
-    pub fn generate(params: &MlweParams, rng: &mut dyn RngCore) -> Self {
+    pub fn generate<R: RngCore + CryptoRng + ?Sized>(params: &MlweParams, rng: &mut R) -> Self {
         KeyPair {
             inner: mlwe::keygen(params, rng),
         }
@@ -113,18 +116,19 @@ pub struct Prover;
 
 impl Prover {
     /// Generate a lattice-based ZK authorization proof.
-    pub fn generate_proof(
+    pub fn generate_proof<R: RngCore + CryptoRng + ?Sized>(
         params: &MlweParams,
         keypair: &KeyPair,
         merkle_proof: &MerkleProof,
         public_inputs: &PublicInputs,
-        rng: &mut dyn RngCore,
+        rng: &mut R,
     ) -> Result<AuthProof, ProtocolError> {
         zk_auth::prove(
             params,
             &keypair.inner,
             merkle_proof,
             &public_inputs.merkle_root,
+            &public_inputs.nullifier,
             &public_inputs.scope,
             rng,
         )
@@ -141,7 +145,7 @@ impl Prover {
 /// 3. Algebraic relation: ‖A·z - w - c·b‖∞ < τ·η·n + 1.
 /// 4. Merkle membership (commitment hash ↔ root).
 ///
-/// Verification runs in constant time relative to the anonymity set size.
+/// Verification cost is proportional to the included Merkle path length.
 pub struct Verifier;
 
 impl Verifier {
@@ -152,14 +156,13 @@ impl Verifier {
     pub fn verify_proof(
         params: &MlweParams,
         proof: &AuthProof,
-        keypair: &KeyPair,
         public_inputs: &PublicInputs,
     ) -> Result<bool, ProtocolError> {
         zk_auth::verify(
             params,
             proof,
-            &keypair.inner.public_key,
             &public_inputs.merkle_root,
+            &public_inputs.nullifier,
             &public_inputs.scope,
         )
     }
@@ -216,12 +219,11 @@ mod tests {
         };
 
         // Prove.
-        let proof =
-            Prover::generate_proof(&params, &user, &merkle_proof, &public_inputs, &mut rng)
-                .unwrap();
+        let proof = Prover::generate_proof(&params, &user, &merkle_proof, &public_inputs, &mut rng)
+            .unwrap();
 
         // Verify.
-        let valid = Verifier::verify_proof(&params, &proof, &user, &public_inputs).unwrap();
+        let valid = Verifier::verify_proof(&params, &proof, &public_inputs).unwrap();
         assert!(valid, "Valid proof must pass verification");
     }
 
@@ -244,16 +246,15 @@ mod tests {
             nullifier,
         };
 
-        let proof =
-            Prover::generate_proof(&params, &user, &merkle_proof, &public_inputs, &mut rng)
-                .unwrap();
+        let proof = Prover::generate_proof(&params, &user, &merkle_proof, &public_inputs, &mut rng)
+            .unwrap();
 
         // Serialize and deserialize.
         let bytes = serialize_proof(&proof).unwrap();
         let recovered = deserialize_proof(&bytes).unwrap();
 
         // Verify the recovered proof.
-        let valid = Verifier::verify_proof(&params, &recovered, &user, &public_inputs).unwrap();
+        let valid = Verifier::verify_proof(&params, &recovered, &public_inputs).unwrap();
         assert!(valid, "Deserialized proof must still verify");
     }
 
@@ -276,9 +277,8 @@ mod tests {
             nullifier,
         };
 
-        let proof =
-            Prover::generate_proof(&params, &user, &merkle_proof, &public_inputs, &mut rng)
-                .unwrap();
+        let proof = Prover::generate_proof(&params, &user, &merkle_proof, &public_inputs, &mut rng)
+            .unwrap();
 
         // Verify with wrong scope.
         let wrong_inputs = PublicInputs {
@@ -287,7 +287,7 @@ mod tests {
             nullifier,
         };
 
-        let valid = Verifier::verify_proof(&params, &proof, &user, &wrong_inputs).unwrap();
+        let valid = Verifier::verify_proof(&params, &proof, &wrong_inputs).unwrap();
         assert!(!valid, "Wrong scope must fail verification");
     }
 }
