@@ -1,17 +1,39 @@
 //! # Obscura
 //!
-//! A Rust library for lattice-based credential authorization using Module-LWE-style
-//! key material, SHAKE-256 commitments, Merkle membership, and Fiat-Shamir-style
-//! transcript challenges.
+//! Obscura provides lattice-based credential authorization with Merkle membership
+//! proofs and scope-bound nullifiers.
 //!
-//! ## Modules
 //!
-//! - [`error`]: Protocol error taxonomy.
-//! - [`poly`]: Polynomial arithmetic in R_q = Z_q\[X\]/(X^256 + 1).
-//! - [`mlwe`]: Module-LWE key generation and challenge sampling.
-//! - [`tree`]: SHAKE-256-based binary Merkle tree (anonymity set).
-//! - [`zk_auth`]: Lattice-based ZK authorization proof/verify (Fiat-Shamir with Aborts).
-//! - [`protocol`]: High-level prover, verifier, and key management API.
+//! # Quick Start
+//!
+//! ```rust
+//! use rand::rngs::OsRng;
+//! use obscura::mlwe::MlweParams;
+//! use obscura::protocol::{KeyPair, Prover, PublicInputs, Verifier};
+//! use obscura::tree::MerkleTree;
+//!
+//! # fn main() -> Result<(), obscura::error::ProtocolError> {
+//! let mut rng = OsRng;
+//! let params = MlweParams::generate(&mut rng);
+//! let mut tree = MerkleTree::new();
+//! let user = KeyPair::generate(&params, &mut rng);
+//! let index = tree.insert(user.commitment())?;
+//! let root = tree.root()?;
+//! let proof_path = tree.generate_inclusion_proof(index)?;
+//! let scope = b"session".to_vec();
+//! let inputs = PublicInputs { merkle_root: root, scope: scope.clone(), nullifier: user.nullifier(&scope) };
+//! let proof = Prover::generate_proof(&params, &user, &proof_path, &inputs, &mut rng)?;
+//! assert!(Verifier::verify_proof(&params, &proof, &inputs)?);
+//! # Ok(()) }
+//! ```
+//!
+//! # Architecture
+//!
+//! The [`poly`] module defines arithmetic over `R_q`, [`mlwe`] builds public
+//! parameters and credential key material, [`tree`] maintains the Merkle
+//! authorization set, and [`zk_auth`] contains the Fiat-Shamir-style proof
+//! relation. The [`protocol`] module exposes the high-level API used by
+//! applications, while [`error`] provides the shared error taxonomy.
 
 pub mod error;
 pub mod mlwe;

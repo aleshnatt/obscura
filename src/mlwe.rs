@@ -1,41 +1,27 @@
-//! # Obscura Protocol — Module-LWE Primitives
+//! Module-LWE parameter and key material for Obscura authorization proofs.
 //!
-//! Implements the Module Learning with Errors (Module-LWE) key generation
-//! and challenge sampling for the post-quantum ZK authorization protocol.
-//!
-//! ## Parameters
-//!
-//! - Ring: R_q = Z_q\[X\]/(X^256 + 1), q = 8,380,417
-//! - Module rank k = 2
-//! - Secret/error bound η = 2 (Centered Binomial Distribution)
-//!
-//! ## Key Generation
-//!
-//! 1. Generate public matrix A ∈ R_q^{k×k} uniformly at random.
-//! 2. Sample secret s ← CBD(η)^k and error e ← CBD(η)^k.
-//! 3. Compute public key b = A · s + e mod q.
-//!
-//! ## Challenge Sampling
-//!
-//! The challenge polynomial c ∈ R_q has exactly τ = 39 non-zero coefficients,
-//! each ±1, and is derived deterministically from the transcript hash
-//! via SHAKE-256.
+//! The module builds public matrices, short secret vectors, public key vectors,
+//! and sparse Fiat-Shamir challenges used by the proof relation. It targets
+//! computational adversaries that cannot recover a short secret from the public
+//! Module-LWE-style relation. It does not provide side-channel resistance, and
+//! its concrete security level requires independent parameter review.
 
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
-use sha3::Shake256;
 use sha3::digest::{ExtendableOutput, Update, XofReader};
+use sha3::Shake256;
+use std::fmt;
 use zeroize::ZeroizeOnDrop;
 
-use crate::poly::{N, Poly, PolyMat, PolyVec, TAU};
-
-// ─── Public Parameters ───────────────────────────────────────────────────────
+use crate::poly::{Poly, PolyMat, PolyVec, K, N, Q, TAU};
 
 /// Module-LWE public parameters.
 ///
-/// Contains the public matrix A which is generated uniformly at random.
-/// In a real deployment, A would be expanded deterministically from a
-/// small seed using SHAKE-256 to reduce parameter size.
+/// The parameter matrix binds key generation, proof generation, and
+/// verification to the same public relation. It carries no secret material, but
+/// using different parameters across parties invalidates proof verification.
+/// Callers should derive shared parameters from an authenticated public seed
+/// when multiple systems must interoperate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MlweParams {
     /// The public k × k polynomial matrix A ∈ R_q^{k×k}.
@@ -43,54 +29,156 @@ pub struct MlweParams {
 }
 
 impl MlweParams {
-    /// Generate fresh MLWE parameters (random matrix A).
+    /// Generates fresh MLWE parameters with a random public matrix.
+    ///
+    /// # Randomness
+    ///
+    /// The `rng` parameter must be a cryptographically secure pseudorandom
+    /// number generator. Passing a weak or deterministic RNG breaks the
+    /// security of generated parameters.
+    ///
+    /// # Security
+    ///
+    /// Parameters generated this way are only shared with parties that receive
+    /// the full matrix. Use [`MlweParams::from_seed`] when independent parties
+    /// must derive the same public parameters.
     pub fn generate<R: RngCore + CryptoRng + ?Sized>(rng: &mut R) -> Self {
         MlweParams {
             matrix_a: PolyMat::sample_uniform(rng),
         }
     }
-}
 
-// ─── Key Pair ────────────────────────────────────────────────────────────────
+    /// Derives shared MLWE parameters from a public 32-byte seed.
+    ///
+    /// # Security
+    ///
+    /// The seed is a public coordination value, not a secret. Callers must
+    /// authenticate the seed or matrix source; an adversary-selected parameter
+    /// set changes the relation being proven.
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
+        let mut hasher = Shake256::default();
+        hasher.update(b"obscura-mlwe-params-v1");
+        hasher.update(seed);
+        let mut xof = hasher.finalize_xof();
 
-/// An MLWE key pair for the ZK authorization protocol.
-///
-/// - `secret_key`: s ∈ R_q^k sampled from CBD(η).
-/// - `public_key`: b = A · s + e mod q ∈ R_q^k.
-///
-/// The public key commitment hash is SHAKE-256("COM_DOM" ∥ serialize(b)).
-#[derive(ZeroizeOnDrop)]
-pub struct MlweKeyPair {
-    /// Secret key vector s ∈ R_q^k with small coefficients (‖s‖∞ ≤ η).
-    pub secret_key: PolyVec,
-    /// Public key vector b = A · s + e mod q ∈ R_q^k.
-    pub public_key: PolyVec,
-}
+        let rows = (0..K)
+            .map(|_| {
+                let polys = (0..K).map(|_| sample_uniform_from_xof(&mut xof)).collect();
+                PolyVec { polys }
+            })
+            .collect();
 
-/// Generate an MLWE key pair.
-///
-/// 1. Sample s ← CBD(η)^k (secret key with small coefficients).
-/// 2. Sample e ← CBD(η)^k (error vector with small coefficients).
-/// 3. Compute b = A · s + e mod q (public key).
-pub fn keygen<R: RngCore + CryptoRng + ?Sized>(params: &MlweParams, rng: &mut R) -> MlweKeyPair {
-    let s = PolyVec::sample_cbd(rng);
-    let e = PolyVec::sample_cbd(rng);
-
-    // b = A · s + e mod q
-    let as_product = params.matrix_a.mul_vec(&s);
-    let b = as_product.add(&e);
-
-    MlweKeyPair {
-        secret_key: s,
-        public_key: b,
+        MlweParams {
+            matrix_a: PolyMat { rows },
+        }
     }
 }
 
-/// Compute the commitment hash of a public key.
+fn sample_uniform_from_xof<X: XofReader>(xof: &mut X) -> Poly {
+    let mut poly = Poly::zero();
+    for coeff in poly.coeffs.iter_mut() {
+        loop {
+            let mut buf = [0u8; 4];
+            xof.read(&mut buf);
+            let val = u32::from_le_bytes(buf) & 0x7F_FFFF;
+            if (val as i64) < Q {
+                *coeff = val as i64;
+                break;
+            }
+        }
+    }
+    poly
+}
+
+/// MLWE key pair used as a credential secret and public commitment source.
 ///
-/// commitment = SHAKE-256("COM_DOM" ∥ serialize(b)), truncated to 32 bytes.
+/// The secret vector is the witness for authorization proofs, and the public
+/// vector is committed into the Merkle authorization set. Debug output redacts
+/// the secret key, but callers must still avoid cloning or serializing it
+/// outside controlled memory. A key pair is only meaningful under the
+/// [`MlweParams`] used to generate it.
+#[derive(ZeroizeOnDrop)]
+pub struct MlweKeyPair {
+    /// Secret key vector s ∈ R_q^k with small coefficients (‖s‖∞ ≤ η).
+    pub(crate) secret_key: PolyVec,
+    /// Public key vector b = A · s + e mod q ∈ R_q^k.
+    pub(crate) public_key: PolyVec,
+}
+
+impl fmt::Debug for MlweKeyPair {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MlweKeyPair")
+            .field("public_key", &self.public_key)
+            .field("secret_key", &"<redacted>")
+            .finish()
+    }
+}
+
+impl MlweKeyPair {
+    /// Returns the public key vector `b = A * s + e`.
+    ///
+    /// # Security
+    ///
+    /// The returned value is public, but it is linkable through its commitment
+    /// hash. Callers should not treat repeated public keys as unlinkable.
+    pub fn public_key(&self) -> &PolyVec {
+        &self.public_key
+    }
+
+    /// Computes the credential commitment for this public key.
+    ///
+    /// # Security
+    ///
+    /// The commitment is deterministic for a public key and is intended to be
+    /// placed in a Merkle authorization set.
+    pub fn commitment(&self) -> [u8; 32] {
+        commitment_hash(&self.public_key)
+    }
+
+    /// Derives the scope-bound nullifier for this key pair.
+    ///
+    /// # Security
+    ///
+    /// The same key and scope produce the same nullifier. Callers must use a
+    /// fresh, protocol-specific scope when linkability across sessions is not
+    /// desired.
+    pub fn nullifier(&self, scope: &[u8]) -> [u8; 32] {
+        crate::zk_auth::derive_nullifier(&self.secret_key, scope)
+    }
+}
+
+/// Generates an MLWE key pair for the supplied public parameters.
 ///
-/// This value is inserted as a leaf into the Merkle tree.
+/// # Randomness
+///
+/// The `rng` parameter must be a cryptographically secure pseudorandom
+/// number generator. Passing a weak or deterministic RNG breaks the
+/// security of the output.
+///
+/// # Security
+///
+/// The returned secret key is the proof witness. It must not be logged,
+/// serialized, or reused with unrelated protocol parameters.
+pub fn keygen<R: RngCore + CryptoRng + ?Sized>(params: &MlweParams, rng: &mut R) -> MlweKeyPair {
+    let secret_key = PolyVec::sample_cbd(rng);
+    let error = PolyVec::sample_cbd(rng);
+
+    let public_without_error = params.matrix_a.mul_vec(&secret_key);
+    let public_key = public_without_error.add(&error);
+
+    MlweKeyPair {
+        secret_key,
+        public_key,
+    }
+}
+
+/// Computes the deterministic credential commitment for a public key.
+///
+/// # Security
+///
+/// The returned hash is domain-separated for credential commitments and is
+/// intended to be inserted as a Merkle leaf. Callers must use the same public
+/// key encoding for both insertion and verification.
 pub fn commitment_hash(public_key: &PolyVec) -> [u8; 32] {
     let mut hasher = Shake256::default();
     hasher.update(b"COM_DOM");
@@ -100,19 +188,13 @@ pub fn commitment_hash(public_key: &PolyVec) -> [u8; 32] {
     output
 }
 
-// ─── Challenge Sampling ──────────────────────────────────────────────────────
-
-/// Sample a challenge polynomial c ∈ R_q with exactly τ non-zero coefficients.
+/// Samples a sparse Fiat-Shamir challenge polynomial from a transcript seed.
 ///
-/// The challenge is derived deterministically from a hash seed using SHAKE-256:
-/// 1. Initialize SHAKE-256 XOF with the seed bytes.
-/// 2. Use rejection sampling from the XOF output to select τ distinct
-///    coefficient positions (Fisher-Yates-like selection).
-/// 3. For each position, read one more byte to determine the sign (±1).
+/// # Security
 ///
-/// The result is a polynomial with exactly τ coefficients set to +1 or -1,
-/// and all remaining coefficients zero. This construction ensures that
-/// ‖c‖₁ = τ and ‖c‖∞ = 1.
+/// The seed must be derived from the full verification transcript under an
+/// unambiguous domain separator. Reusing this sampler on incomplete transcripts
+/// can break soundness assumptions.
 pub fn sample_challenge(seed: &[u8]) -> Poly {
     let mut hasher = Shake256::default();
     hasher.update(seed);
@@ -120,25 +202,21 @@ pub fn sample_challenge(seed: &[u8]) -> Poly {
 
     let mut c = Poly::zero();
 
-    // Read 8 bytes for the sign bits (we need τ = 39 sign bits).
     let mut sign_bytes = [0u8; 8];
     xof.read(&mut sign_bytes);
     let signs = u64::from_le_bytes(sign_bytes);
 
-    // Fisher-Yates-style position selection.
-    // Start with positions [0..N-1] available; select τ random distinct positions.
     let mut positions = [0u16; N];
     for (i, position) in positions.iter_mut().enumerate() {
         *position = i as u16;
     }
 
     for i in 0..TAU {
-        // Sample a random index in [0, N - i) by rejection.
         let bound = (N - i) as u16;
         let j = loop {
-            let mut buf = [0u8; 2];
-            xof.read(&mut buf);
-            let val = u16::from_le_bytes(buf) as u32;
+            let mut candidate_bytes = [0u8; 2];
+            xof.read(&mut candidate_bytes);
+            let val = u16::from_le_bytes(candidate_bytes) as u32;
             let bound = bound as u32;
             let zone = 65_536 - (65_536 % bound);
             if val < zone {
@@ -146,16 +224,14 @@ pub fn sample_challenge(seed: &[u8]) -> Poly {
             }
         };
 
-        // Swap positions[N-1-i] and positions[j].
         let swap_idx = N - 1 - i;
         positions.swap(swap_idx, j);
 
-        // Assign ±1 based on sign bit.
         let pos = positions[swap_idx] as usize;
         if (signs >> i) & 1 == 0 {
             c.coeffs[pos] = 1;
         } else {
-            c.coeffs[pos] = crate::poly::Q - 1; // -1 mod q
+            c.coeffs[pos] = crate::poly::Q - 1;
         }
     }
 
@@ -166,21 +242,19 @@ pub fn sample_challenge(seed: &[u8]) -> Poly {
 mod tests {
     use super::*;
     use crate::poly::{K, Q};
-    use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     #[test]
     fn test_keygen_public_key_structure() {
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(42);
         let params = MlweParams::generate(&mut rng);
         let keypair = keygen(&params, &mut rng);
 
-        // Public key should have k polynomials.
         assert_eq!(keypair.public_key.polys.len(), K);
-        // Secret key should have k polynomials.
         assert_eq!(keypair.secret_key.polys.len(), K);
 
-        // Secret key coefficients should be small (CBD bound).
         for poly in &keypair.secret_key.polys {
             assert!(poly.infinity_norm() <= 2, "Secret key norm too large");
         }
@@ -188,6 +262,7 @@ mod tests {
 
     #[test]
     fn test_commitment_hash_deterministic() {
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(43);
         let params = MlweParams::generate(&mut rng);
         let keypair = keygen(&params, &mut rng);
@@ -199,6 +274,7 @@ mod tests {
 
     #[test]
     fn test_commitment_hash_different_keys() {
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(44);
         let params = MlweParams::generate(&mut rng);
         let kp1 = keygen(&params, &mut rng);
@@ -214,7 +290,6 @@ mod tests {
         let seed = b"test_challenge_seed_12345";
         let c = sample_challenge(seed);
 
-        // Count non-zero coefficients.
         let nonzero_count = c.coeffs.iter().filter(|&&x| x != 0).count();
         assert_eq!(
             nonzero_count, TAU,
@@ -222,7 +297,6 @@ mod tests {
             TAU, nonzero_count
         );
 
-        // All non-zero coefficients must be ±1 (i.e., 1 or q-1).
         for &coeff in &c.coeffs {
             if coeff != 0 {
                 assert!(
@@ -247,5 +321,39 @@ mod tests {
         let c1 = sample_challenge(b"seed_A");
         let c2 = sample_challenge(b"seed_B");
         assert_ne!(c1, c2, "Different seeds must produce different challenges");
+    }
+
+    #[test]
+    fn test_from_seed_is_deterministic() {
+        let seed = [7u8; 32];
+        let params_a = MlweParams::from_seed(&seed);
+        let params_b = MlweParams::from_seed(&seed);
+
+        for (row_a, row_b) in params_a.matrix_a.rows.iter().zip(&params_b.matrix_a.rows) {
+            for (poly_a, poly_b) in row_a.polys.iter().zip(&row_b.polys) {
+                assert_eq!(poly_a.coeffs, poly_b.coeffs);
+            }
+        }
+    }
+
+    #[test]
+    fn test_from_seed_differs_by_seed() {
+        let params_a = MlweParams::from_seed(&[1u8; 32]);
+        let params_b = MlweParams::from_seed(&[2u8; 32]);
+
+        let differs = params_a
+            .matrix_a
+            .rows
+            .iter()
+            .zip(&params_b.matrix_a.rows)
+            .any(|(row_a, row_b)| {
+                row_a
+                    .polys
+                    .iter()
+                    .zip(&row_b.polys)
+                    .any(|(poly_a, poly_b)| poly_a.coeffs != poly_b.coeffs)
+            });
+
+        assert!(differs, "Different seeds must produce different parameters");
     }
 }

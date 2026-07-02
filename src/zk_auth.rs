@@ -1,55 +1,32 @@
-//! # Obscura Protocol — Lattice-Based ZK Authorization
+//! Fiat-Shamir-style authorization proofs over Module-LWE key material.
 //!
-//! Implements the post-quantum Zero-Knowledge authorization protocol based
-//! on the Fiat-Shamir with Aborts paradigm over Module-LWE/Module-SIS.
-//!
-//! ## Proving Protocol
-//!
-//! Given a secret key s, public key b = A·s + e, and a Merkle root:
-//!
-//! 1. Derive nullifier = SHAKE-256("NUL_DOM" ∥ s ∥ scope).
-//! 2. Sample masking vector y ← Uniform([-γ₁+1, γ₁])^{k·n}.
-//! 3. Compute commitment w = A · y mod q.
-//! 4. Compute challenge c = ChallengeHash(root, nullifier, w, scope).
-//! 5. Compute response z = y + c · s mod q.
-//! 6. Rejection sampling: check ‖z‖∞ < γ₁ - β; abort if not.
-//! 7. Output pi = (public_key, z, c, nullifier, merkle_path, commitment_hash, w_bytes).
-//!
-//! ## Verification Protocol
-//!
-//! 1. Check ‖z‖∞ < γ₁ - β.
-//! 2. Reconstruct w from w_bytes.
-//! 3. Recompute c' from (root, nullifier, w, scope) and check c' = c.
-//! 4. Verify A·z - w - c·b has small norm.
-//! 5. Verify Merkle path from commitment_hash to root.
+//! This module binds a credential public key, a scope-bound nullifier, and a
+//! Merkle membership proof into one verification statement. It is designed to
+//! reject malformed proof objects without panicking and to resist a
+//! computationally bounded prover that does not know the committed short
+//! secret. It does not provide a formally audited zero-knowledge guarantee, and
+//! timing side channels exist on norm checks and polynomial arithmetic.
 
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
-use sha3::Shake256;
 use sha3::digest::{ExtendableOutput, Update, XofReader};
+use sha3::Shake256;
 
 use crate::error::ProtocolError;
-use crate::mlwe::{MlweKeyPair, MlweParams, commitment_hash, sample_challenge};
-use crate::poly::{BETA, GAMMA1, N, Poly, PolyVec, TAU};
+use crate::mlwe::{commitment_hash, sample_challenge, MlweKeyPair, MlweParams};
+use crate::poly::{Poly, PolyVec, BETA, ETA, GAMMA1, K, TAU};
 use crate::tree::MerkleProof;
 
 /// Maximum number of rejection sampling attempts before hard failure.
 const MAX_ATTEMPTS: u32 = 1000;
 
-// ─── Proof Structure ─────────────────────────────────────────────────────────
-
-/// A lattice-based ZK authorization proof.
+/// Lattice-based authorization proof for one credential and scope.
 ///
-/// Contains all data needed for verification:
-/// - Public key vector b.
-/// - Response vector z (the masked secret).
-/// - Challenge polynomial c.
-/// - Nullifier (links proof to scope without revealing identity).
-/// - Merkle path proving public key membership.
-/// - Commitment hash (the leaf value).
-/// - Serialized commitment w = A·y for challenge reconstruction.
-///
-/// Serialized size depends on the Merkle path length and serialization format.
+/// The proof carries the public key, bounded response, Fiat-Shamir challenge,
+/// nullifier, Merkle path, and commitment transcript needed by the verifier.
+/// It enforces no trust by construction after deserialization; callers must run
+/// verification against trusted public inputs before accepting it. The
+/// nullifier and Merkle path are public and may be linkable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthProof {
     /// Public key vector whose commitment is proven in the Merkle tree.
@@ -68,15 +45,13 @@ pub struct AuthProof {
     pub w_bytes: Vec<u8>,
 }
 
-// ─── Nullifier Derivation ────────────────────────────────────────────────────
-
-/// Derive the nullifier for a given secret key and scope.
+/// Derives the nullifier for a secret key and authorization scope.
 ///
-/// nullifier = SHAKE-256("NUL_DOM" ∥ serialize(s) ∥ scope), truncated to 32 bytes.
+/// # Security
 ///
-/// The nullifier binds the proof to the scope (e.g., a session challenge)
-/// without revealing which secret key was used. The same (s, scope) pair
-/// always produces the same nullifier, enabling replay detection.
+/// The same secret key and scope always produce the same nullifier. Callers
+/// must choose scopes that match their replay and linkability requirements, and
+/// must not reuse scopes across contexts that should remain unlinkable.
 pub fn derive_nullifier(secret_key: &PolyVec, scope: &[u8]) -> [u8; 32] {
     let mut hasher = Shake256::default();
     hasher.update(b"NUL_DOM");
@@ -86,8 +61,6 @@ pub fn derive_nullifier(secret_key: &PolyVec, scope: &[u8]) -> [u8; 32] {
     hasher.finalize_xof().read(&mut output);
     output
 }
-
-// ─── Challenge Hash ──────────────────────────────────────────────────────────
 
 /// Compute the challenge hash seed from the proof transcript.
 ///
@@ -112,29 +85,29 @@ fn challenge_hash_seed(
     seed
 }
 
-// ─── Prove ───────────────────────────────────────────────────────────────────
-
-/// Generate a ZK authorization proof.
+/// Generates an authorization proof for a committed credential.
 ///
-/// The prover proves knowledge of a short MLWE secret key s whose
-/// public key b is committed in a Merkle tree with the given root, without
-/// revealing s.
+/// The proof binds the key pair, Merkle inclusion path, trusted root, expected
+/// nullifier, and scope into one transcript.
 ///
-/// ## Arguments
+/// # Errors
 ///
-/// * `params` - MLWE public parameters (matrix A).
-/// * `keypair` - The prover's MLWE key pair (s, b).
-/// * `merkle_proof` - Merkle inclusion proof for the public key commitment.
-/// * `root` - The expected Merkle root (32-byte hash).
-/// * `scope` - Session-specific challenge scope (arbitrary bytes).
-/// * `rng` - Cryptographic random number generator.
+/// Returns [`ProtocolError::ChallengeFailure`] if `expected_nullifier` does not
+/// match the nullifier derived from `keypair` and `scope`. Returns
+/// [`ProtocolError::ProofGenerationFailure`] if rejection sampling fails to
+/// find a response below the norm bound within the configured attempt limit.
 ///
-/// ## Rejection Sampling
+/// # Randomness
 ///
-/// The protocol uses the Fiat-Shamir with Aborts paradigm: if the
-/// response z has ‖z‖∞ ≥ γ₁ - β, the attempt is aborted and
-/// restarted with a fresh masking vector. This ensures z does not
-/// leak information about s. Expected attempts: ~4-5 per proof.
+/// The `rng` parameter must be a cryptographically secure pseudorandom
+/// number generator. Passing a weak or deterministic RNG breaks the
+/// security of the output.
+///
+/// # Security
+///
+/// `root` must be the trusted authorization root for `merkle_proof`, and
+/// `scope` must be chosen by the verifier or application context. This function
+/// does not validate Merkle membership before returning a proof object.
 pub fn prove<R: RngCore + CryptoRng + ?Sized>(
     params: &MlweParams,
     keypair: &MlweKeyPair,
@@ -144,47 +117,37 @@ pub fn prove<R: RngCore + CryptoRng + ?Sized>(
     scope: &[u8],
     rng: &mut R,
 ) -> Result<AuthProof, ProtocolError> {
-    // Step 1: Derive nullifier.
     let nullifier = derive_nullifier(&keypair.secret_key, scope);
     if &nullifier != expected_nullifier {
         return Err(ProtocolError::ChallengeFailure);
     }
 
-    // Precompute the commitment hash of the public key.
-    let comm_hash = commitment_hash(&keypair.public_key);
+    let credential_commitment = commitment_hash(&keypair.public_key);
 
-    // Rejection sampling loop.
     for _attempt in 0..MAX_ATTEMPTS {
-        // Step 2: Sample masking vector y.
-        let y = PolyVec::sample_masking(rng);
+        let masking_vector = PolyVec::sample_masking(rng);
 
-        // Step 3: Compute commitment w = A · y mod q.
-        let w = params.matrix_a.mul_vec(&y);
-        let w_bytes = w.to_bytes();
+        let transcript_commitment = params.matrix_a.mul_vec(&masking_vector);
+        let w_bytes = transcript_commitment.to_bytes();
 
-        // Step 4: Compute challenge c.
         let seed = challenge_hash_seed(root, &nullifier, &w_bytes, scope);
-        let c = sample_challenge(&seed);
+        let challenge = sample_challenge(&seed);
 
-        // Step 5: Compute response z = y + c · s mod q.
-        // c · s is computed as: for each component s_i, multiply by c.
-        let cs = keypair.secret_key.scalar_mul(&c);
-        let z = y.add(&cs);
+        let challenge_secret = keypair.secret_key.scalar_mul(&challenge);
+        let response = masking_vector.add(&challenge_secret);
 
-        // Step 6: Rejection sampling — check ‖z‖∞ < γ₁ - β.
         let bound = GAMMA1 - BETA;
-        if z.infinity_norm() >= bound {
-            continue; // Abort this attempt, try again.
+        if response.infinity_norm() >= bound {
+            continue;
         }
 
-        // Step 7: Construct proof.
         return Ok(AuthProof {
             public_key: keypair.public_key.clone(),
-            z,
-            c,
+            z: response,
+            c: challenge,
             nullifier,
             merkle_path: merkle_proof.clone(),
-            commitment_hash: comm_hash,
+            commitment_hash: credential_commitment,
             w_bytes,
         });
     }
@@ -197,21 +160,34 @@ pub fn prove<R: RngCore + CryptoRng + ?Sized>(
     })
 }
 
-// ─── Verify ──────────────────────────────────────────────────────────────────
-
-/// Verify a ZK authorization proof.
+/// Verifies an authorization proof against public inputs.
 ///
-/// ## Verification Steps
+/// Returns `Ok(true)` if the proof is valid and `Ok(false)` if any structural,
+/// transcript, algebraic, nullifier, or Merkle-membership check fails.
 ///
-/// 1. Check ‖z‖∞ < γ₁ - β (response norm bound).
-/// 2. Reconstruct w from w_bytes.
-/// 3. Recompute challenge c' from (root, nullifier, w, scope) and check c' = c.
-/// 4. Compute diff = A·z - w - c·b mod q and check ‖diff‖∞ is small.
-/// 5. Verify that commitment_hash matches the leaf in the Merkle path for the root.
+/// # Errors
 ///
-/// ## Returns
+/// This function currently returns verification failures as `Ok(false)` and
+/// reserves [`ProtocolError`] for future structural failures that prevent
+/// verification from running.
 ///
-/// `Ok(true)` if the proof is valid, `Ok(false)` if any check fails.
+/// # Untrusted Input
+///
+/// This function accepts data from untrusted sources. All structural
+/// checks are performed before any arithmetic. Malformed input is
+/// rejected with `Ok(false)` rather than panicking.
+///
+/// # Timing
+///
+/// This function is not constant-time with respect to its input.
+/// Callers on secret data accept a timing side-channel risk.
+///
+/// # Security
+///
+/// `root` must be obtained from a trusted source, `expected_nullifier` must be
+/// computed for the intended scope, and `params` must match the prover's
+/// parameter set. An adversary-controlled root can make membership statements
+/// refer to an adversary-chosen authorization set.
 pub fn verify(
     params: &MlweParams,
     proof: &AuthProof,
@@ -219,57 +195,55 @@ pub fn verify(
     expected_nullifier: &[u8; 32],
     scope: &[u8],
 ) -> Result<bool, ProtocolError> {
+    if proof.public_key.polys.len() != K {
+        return Ok(false);
+    }
+    if proof.z.polys.len() != K {
+        return Ok(false);
+    }
+
     if proof.nullifier != *expected_nullifier {
         return Ok(false);
     }
 
-    // Step 1: Check response norm bound.
     let bound = GAMMA1 - BETA;
     if proof.z.infinity_norm() >= bound {
         return Ok(false);
     }
 
-    // Step 2: Reconstruct w from w_bytes.
-    let w = match PolyVec::from_bytes(&proof.w_bytes) {
-        Some(w) => w,
+    let transcript_commitment = match PolyVec::from_bytes(&proof.w_bytes) {
+        Some(transcript_commitment) => transcript_commitment,
         None => return Ok(false),
     };
 
-    // Step 3: Recompute challenge and verify consistency.
     let seed = challenge_hash_seed(root, &proof.nullifier, &proof.w_bytes, scope);
-    let c_prime = sample_challenge(&seed);
-    if c_prime != proof.c {
+    let expected_challenge = sample_challenge(&seed);
+    if expected_challenge != proof.c {
         return Ok(false);
     }
 
-    // Step 4: Verify algebraic relation.
-    //
     // In the honest case:
     //   z = y + c·s
     //   A·z = A·(y + c·s) = A·y + c·(A·s) = w - c·e + c·(b - e) + c·e
     //       = w + c·b - c·e
     //
     // So: diff = A·z - w - c·b = -c·e
-    // Since ‖e‖∞ ≤ η and ‖c‖₁ = τ, ‖c·e‖∞ ≤ τ·η·n (loose bound).
-    //
-    // We check ‖diff‖∞ < τ · η · n + 1 = 39 · 2 · 256 + 1 = 19,969.
+    // Since ||e||_inf <= eta and ||c||_1 = tau, every coefficient of c*e
+    // is a signed sum of at most tau error coefficients, each bounded by eta.
     let az = params.matrix_a.mul_vec(&proof.z);
     let cb = proof.public_key.scalar_mul(&proof.c);
-    let diff = az.sub(&w).sub(&cb);
+    let diff = az.sub(&transcript_commitment).sub(&cb);
 
-    let diff_bound = (TAU as i64) * 2 * (N as i64) + 1;
+    let diff_bound = (TAU as i64) * ETA + 1;
     if diff.infinity_norm() >= diff_bound {
         return Ok(false);
     }
 
-    // Step 5: Verify Merkle membership.
-    // Check that the commitment hash matches the expected public key commitment.
     let expected_commitment = commitment_hash(&proof.public_key);
     if expected_commitment != proof.commitment_hash {
         return Ok(false);
     }
 
-    // Check that the Merkle path validates from the commitment to the root.
     if proof.merkle_path.leaf != proof.commitment_hash {
         return Ok(false);
     }
@@ -286,18 +260,18 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mlwe::{MlweParams, keygen};
+    use crate::mlwe::{keygen, MlweParams};
     use crate::tree::MerkleTree;
-    use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     fn setup_test_scenario(
         seed: u64,
     ) -> (MlweParams, MlweKeyPair, MerkleTree, [u8; 32], MerkleProof) {
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(seed);
         let params = MlweParams::generate(&mut rng);
 
-        // Generate some dummy users.
         let mut tree = MerkleTree::new();
         for _ in 0..3 {
             let dummy_kp = keygen(&params, &mut rng);
@@ -305,7 +279,6 @@ mod tests {
             tree.insert(comm).unwrap();
         }
 
-        // Generate the prover's key pair.
         let user_kp = keygen(&params, &mut rng);
         let user_comm = commitment_hash(&user_kp.public_key);
         let user_idx = tree.insert(user_comm).unwrap();
@@ -318,6 +291,7 @@ mod tests {
     #[test]
     fn test_prove_and_verify_roundtrip() {
         let (params, user_kp, _tree, root, merkle_proof) = setup_test_scenario(100);
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(200);
         let scope = b"session_challenge_42";
 
@@ -341,6 +315,7 @@ mod tests {
     #[test]
     fn test_wrong_scope_rejected() {
         let (params, user_kp, _tree, root, merkle_proof) = setup_test_scenario(101);
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(201);
         let scope = b"correct_scope";
 
@@ -356,7 +331,6 @@ mod tests {
         )
         .expect("Proof generation should succeed");
 
-        // Verify with wrong scope.
         let valid = verify(&params, &proof, &root, &nullifier, b"wrong_scope")
             .expect("Verification must run");
         assert!(!valid, "Wrong scope must fail verification");
@@ -365,6 +339,7 @@ mod tests {
     #[test]
     fn test_wrong_root_rejected() {
         let (params, user_kp, _tree, root, merkle_proof) = setup_test_scenario(102);
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(202);
         let scope = b"test_scope";
 
@@ -380,8 +355,7 @@ mod tests {
         )
         .expect("Proof generation should succeed");
 
-        // Verify with wrong root.
-        let wrong_root = [0xFFu8; 32];
+        let wrong_root = [0xFFu8; 32]; // simulate an untrusted root substitution
         let valid =
             verify(&params, &proof, &wrong_root, &nullifier, scope).expect("Verification must run");
         assert!(!valid, "Wrong root must fail verification");
@@ -390,6 +364,7 @@ mod tests {
     #[test]
     fn test_wrong_public_key_rejected() {
         let (params, user_kp, _tree, root, merkle_proof) = setup_test_scenario(103);
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(203);
         let scope = b"test_scope";
 
@@ -405,10 +380,9 @@ mod tests {
         )
         .expect("Proof generation should succeed");
 
-        // Tamper with the public key embedded in the proof.
         let wrong_kp = keygen(&params, &mut rng);
         let mut proof = proof;
-        proof.public_key = wrong_kp.public_key.clone();
+        proof.public_key = wrong_kp.public_key().clone(); // simulate public-key substitution
         let valid =
             verify(&params, &proof, &root, &nullifier, scope).expect("Verification must run");
         assert!(!valid, "Wrong public key must fail verification");
@@ -416,6 +390,7 @@ mod tests {
 
     #[test]
     fn test_nullifier_determinism() {
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(104);
         let params = MlweParams::generate(&mut rng);
         let kp = keygen(&params, &mut rng);
@@ -428,6 +403,7 @@ mod tests {
 
     #[test]
     fn test_nullifier_uniqueness() {
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(105);
         let params = MlweParams::generate(&mut rng);
         let kp = keygen(&params, &mut rng);
@@ -440,6 +416,7 @@ mod tests {
     #[test]
     fn test_tampered_z_rejected() {
         let (params, user_kp, _tree, root, merkle_proof) = setup_test_scenario(106);
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(206);
         let scope = b"tamper_test";
 
@@ -455,11 +432,62 @@ mod tests {
         )
         .expect("Proof generation should succeed");
 
-        // Tamper with z.
-        proof.z.polys[0].coeffs[0] = (proof.z.polys[0].coeffs[0] + 1) % crate::poly::Q;
+        proof.z.polys[0].coeffs[0] = (proof.z.polys[0].coeffs[0] + 1) % crate::poly::Q; // simulate response tampering
 
         let valid =
             verify(&params, &proof, &root, &nullifier, scope).expect("Verification must run");
         assert!(!valid, "Tampered z must fail verification");
+    }
+
+    #[test]
+    fn test_verify_rejects_wrong_pubkey_len() {
+        let (params, user_kp, _tree, root, merkle_proof) = setup_test_scenario(107);
+        // Seeded for test determinism. Production code must use OsRng.
+        let mut rng = StdRng::seed_from_u64(207);
+        let scope = b"wrong_pubkey_len";
+
+        let nullifier = derive_nullifier(&user_kp.secret_key, scope);
+        let mut proof = prove(
+            &params,
+            &user_kp,
+            &merkle_proof,
+            &root,
+            &nullifier,
+            scope,
+            &mut rng,
+        )
+        .expect("Proof generation should succeed");
+
+        proof.public_key.polys.push(Poly::zero()); // simulate a malformed public-key vector
+
+        let valid =
+            verify(&params, &proof, &root, &nullifier, scope).expect("Verification must run");
+        assert!(!valid, "Malformed public key length must be rejected");
+    }
+
+    #[test]
+    fn test_verify_rejects_wrong_z_len() {
+        let (params, user_kp, _tree, root, merkle_proof) = setup_test_scenario(108);
+        // Seeded for test determinism. Production code must use OsRng.
+        let mut rng = StdRng::seed_from_u64(208);
+        let scope = b"wrong_z_len";
+
+        let nullifier = derive_nullifier(&user_kp.secret_key, scope);
+        let mut proof = prove(
+            &params,
+            &user_kp,
+            &merkle_proof,
+            &root,
+            &nullifier,
+            scope,
+            &mut rng,
+        )
+        .expect("Proof generation should succeed");
+
+        proof.z.polys.truncate(0); // simulate a truncated response vector
+
+        let valid =
+            verify(&params, &proof, &root, &nullifier, scope).expect("Verification must run");
+        assert!(!valid, "Malformed response length must be rejected");
     }
 }

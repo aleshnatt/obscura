@@ -1,30 +1,15 @@
-//! # Obscura Protocol — Polynomial Arithmetic
+//! Polynomial arithmetic for the Obscura credential proof relation.
 //!
-//! Implements polynomial arithmetic in the ring:
-//!
-//!   R_q = Z_q\[X\] / (X^256 + 1)
-//!
-//! with parameters:
-//! - Ring dimension n = 256
-//! - Modulus q = 8,380,417 (NTT-friendly prime, q ≡ 1 mod 512)
-//!
-//! ## Types
-//!
-//! - [`Poly`]: A single polynomial with 256 coefficients in [0, q).
-//! - [`PolyVec`]: A vector of k polynomials (module rank k = 2).
-//! - [`PolyMat`]: A k × k matrix of polynomials.
-//!
-//! ## Operations
-//!
-//! Polynomial multiplication uses schoolbook multiplication reduced
-//! modulo X^256 + 1 (negacyclic convolution). All arithmetic is
-//! performed with signed intermediate values and reduced to [0, q).
+//! This module implements arithmetic in `R_q = Z_q[X] / (X^256 + 1)` for
+//! Module-LWE-style keys, responses, and verifier relations. It is intended to
+//! resist malformed coefficient encodings by rejecting out-of-range serialized
+//! data before arithmetic is performed. It does not protect against timing
+//! side channels; norm checks, comparisons, and schoolbook multiplication have
+//! data-dependent execution paths.
 
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
-
-// ─── Constants ───────────────────────────────────────────────────────────────
 
 /// Ring dimension: polynomials have 256 coefficients.
 pub const N: usize = 256;
@@ -32,30 +17,35 @@ pub const N: usize = 256;
 /// Module rank: vectors/matrices are of dimension k = 2.
 pub const K: usize = 2;
 
-/// Prime modulus. q = 8,380,417 = 2^23 - 2^13 + 1.
-/// This is NTT-friendly: q ≡ 1 (mod 512), enabling efficient transforms.
+/// Prime modulus `q = 8_380_417 = 2^23 - 2^13 + 1`.
 pub const Q: i64 = 8_380_417;
 
 /// Half of q, used for centered representation conversion.
 pub const Q_HALF: i64 = Q / 2;
 
 /// Secret key coefficient bound (Centered Binomial Distribution parameter).
-pub const ETA: u32 = 2;
+pub const ETA: i64 = 2;
 
 /// Challenge polynomial weight: number of non-zero (±1) coefficients.
 pub const TAU: usize = 39;
 
-/// Masking vector uniform range: coefficients in [-γ₁+1, γ₁].
-pub const GAMMA1: i64 = 1 << 17; // 131,072
+/// Masking vector uniform range: coefficients in `[-gamma1 + 1, gamma1]`.
+pub const GAMMA1: i64 = 1 << 17;
 
-/// Rejection bound: β = τ · η · 2 = 39 · 2 · 2 = 156.
-pub const BETA: i64 = (TAU as i64) * (ETA as i64) * 2;
-
-// ─── Polynomial ──────────────────────────────────────────────────────────────
-
-/// A polynomial in R_q = Z_q\[X\]/(X^256 + 1).
+/// Rejection bound: beta = tau * eta = 39 * 2 = 78.
 ///
-/// Coefficients are stored in standard (non-NTT) form as values in [0, q).
+/// This is the maximum infinity-norm contribution of c * s or c * e when
+/// the challenge has tau non-zero +/-1 coefficients and the secret/error
+/// coefficients are bounded by eta.
+pub const BETA: i64 = (TAU as i64) * ETA;
+
+/// Polynomial element in `R_q = Z_q[X] / (X^256 + 1)`.
+///
+/// This type carries coefficient data used in public keys, secret keys,
+/// masking vectors, challenges, and verifier relations. The type enforces the
+/// fixed ring dimension; deserialization additionally enforces coefficients in
+/// `[0, q)`. Callers that place secrets in a `Poly` must account for the
+/// non-constant-time arithmetic and comparison routines in this module.
 #[derive(Debug, Clone, PartialEq, Eq, Zeroize)]
 pub struct Poly {
     /// 256 coefficients representing a₀ + a₁X + a₂X² + ... + a₂₅₅X²⁵⁵.
@@ -82,6 +72,14 @@ impl<'de> Deserialize<'de> for Poly {
         }
         let mut coeffs = [0i64; N];
         coeffs.copy_from_slice(&vec);
+        for &coeff in &coeffs {
+            if !(0..Q).contains(&coeff) {
+                return Err(serde::de::Error::custom(format!(
+                    "coefficient out of range [0, {}): {}",
+                    Q, coeff
+                )));
+            }
+        }
         Ok(Poly { coeffs })
     }
 }
@@ -93,21 +91,35 @@ impl Default for Poly {
 }
 
 impl Poly {
-    /// The zero polynomial.
+    /// Returns the zero polynomial.
+    ///
+    /// # Security
+    ///
+    /// The value carries no entropy and must not be used as a secret or mask.
+    #[must_use]
     pub fn zero() -> Self {
         Poly { coeffs: [0i64; N] }
     }
 
-    /// Reduce all coefficients to [0, q).
+    /// Reduces all coefficients to `[0, q)`.
+    ///
+    /// # Timing
+    ///
+    /// This function is not constant-time with respect to its input.
+    /// Callers on secret data accept a timing side-channel risk.
     pub fn reduce(&mut self) {
         for c in self.coeffs.iter_mut() {
             *c = c.rem_euclid(Q);
         }
     }
 
-    /// Compute the infinity norm of the polynomial in centered representation.
+    /// Computes the infinity norm in centered representation.
     ///
-    /// Maps each coefficient c ∈ [0, q) to [-q/2, q/2] and returns max |c|.
+    /// # Timing
+    ///
+    /// This function is not constant-time with respect to its input.
+    /// Callers on secret data accept a timing side-channel risk.
+    #[must_use]
     pub fn infinity_norm(&self) -> i64 {
         let mut max = 0i64;
         for &c in &self.coeffs {
@@ -120,7 +132,13 @@ impl Poly {
         max
     }
 
-    /// Add two polynomials in R_q.
+    /// Adds two polynomials in `R_q`.
+    ///
+    /// # Timing
+    ///
+    /// This function is not constant-time with respect to its input.
+    /// Callers on secret data accept a timing side-channel risk.
+    #[must_use]
     pub fn add(&self, other: &Poly) -> Poly {
         let mut result = Poly::zero();
         for i in 0..N {
@@ -129,7 +147,13 @@ impl Poly {
         result
     }
 
-    /// Subtract: self - other mod q.
+    /// Subtracts `other` from `self` in `R_q`.
+    ///
+    /// # Timing
+    ///
+    /// This function is not constant-time with respect to its input.
+    /// Callers on secret data accept a timing side-channel risk.
+    #[must_use]
     pub fn sub(&self, other: &Poly) -> Poly {
         let mut result = Poly::zero();
         for i in 0..N {
@@ -138,13 +162,18 @@ impl Poly {
         result
     }
 
-    /// Multiply two polynomials in R_q = Z_q\[X\]/(X^256 + 1).
+    /// Multiplies two polynomials in `R_q = Z_q[X] / (X^256 + 1)`.
     ///
-    /// Uses schoolbook multiplication with negacyclic reduction:
-    /// X^256 ≡ -1, so if the product coefficient index ≥ N,
-    /// it wraps around with a sign flip.
+    /// Uses schoolbook multiplication with negacyclic reduction. Terms whose
+    /// degree reaches `N` wrap back with a sign flip because `X^N = -1`.
+    ///
+    /// # Timing
+    ///
+    /// This function is not constant-time with respect to its input.
+    /// Callers on secret data accept a timing side-channel risk.
+    #[must_use]
     pub fn mul(&self, other: &Poly) -> Poly {
-        let mut result = [0i128; N];
+        let mut product_coeffs = [0i128; N];
 
         for i in 0..N {
             if self.coeffs[i] == 0 {
@@ -157,35 +186,33 @@ impl Poly {
                 let product = (self.coeffs[i] as i128) * (other.coeffs[j] as i128);
                 let idx = i + j;
                 if idx < N {
-                    result[idx] += product;
+                    product_coeffs[idx] += product;
                 } else {
-                    // X^N ≡ -1 in the negacyclic ring
-                    result[idx - N] -= product;
+                    product_coeffs[idx - N] -= product;
                 }
             }
         }
 
         let mut out = Poly::zero();
-        for (out_coeff, value) in out.coeffs.iter_mut().zip(result) {
+        for (out_coeff, value) in out.coeffs.iter_mut().zip(product_coeffs) {
             *out_coeff = (value.rem_euclid(Q as i128)) as i64;
         }
         out
     }
 
-    /// Sample a polynomial with coefficients from the Centered Binomial
-    /// Distribution CBD(η) where η = 2.
+    /// Samples a polynomial from the centered binomial distribution with `eta = 2`.
     ///
-    /// For each coefficient: sample 2η uniform bits, split into two halves,
-    /// compute (popcount(first_half) - popcount(second_half)).
-    /// Result is in [-η, η] = [-2, 2].
+    /// # Randomness
+    ///
+    /// The `rng` parameter must be a cryptographically secure pseudorandom
+    /// number generator. Passing a weak or deterministic RNG breaks the
+    /// security of the output.
     pub fn sample_cbd<R: RngCore + CryptoRng + ?Sized>(rng: &mut R) -> Poly {
         let mut poly = Poly::zero();
-        // For η=2, we need 2*η = 4 bits per coefficient, so 4*256 = 1024 bits = 128 bytes.
         let mut bytes = [0u8; 128];
         rng.fill_bytes(&mut bytes);
 
         for i in 0..N {
-            // Extract 4 bits for coefficient i.
             let bit_offset = i * 4;
             let byte_idx = bit_offset / 8;
             let bit_idx = bit_offset % 8;
@@ -193,13 +220,11 @@ impl Poly {
             let nibble = if bit_idx <= 4 {
                 (bytes[byte_idx] >> bit_idx) & 0x0F
             } else {
-                // Spans two bytes.
                 let lo = bytes[byte_idx] >> bit_idx;
                 let hi = bytes[byte_idx + 1] << (8 - bit_idx);
                 (lo | hi) & 0x0F
             };
 
-            // First 2 bits → a, last 2 bits → b. Coefficient = popcount(a) - popcount(b).
             let a_bits = nibble & 0x03;
             let b_bits = (nibble >> 2) & 0x03;
             let a_count = (a_bits & 1) + ((a_bits >> 1) & 1);
@@ -211,16 +236,22 @@ impl Poly {
         poly
     }
 
-    /// Sample a polynomial with coefficients uniformly in [0, q).
+    /// Samples a polynomial with coefficients uniformly in `[0, q)`.
+    ///
+    /// # Randomness
+    ///
+    /// The `rng` parameter must be a cryptographically secure pseudorandom
+    /// number generator. Passing a weak or deterministic RNG breaks the
+    /// security of the output.
     pub fn sample_uniform<R: RngCore + CryptoRng + ?Sized>(rng: &mut R) -> Poly {
         let mut poly = Poly::zero();
         for c in poly.coeffs.iter_mut() {
             loop {
-                let mut buf = [0u8; 4];
-                rng.fill_bytes(&mut buf);
-                let val = u32::from_le_bytes(buf) & 0x7F_FFFF; // 23-bit mask (q < 2^23)
-                if (val as i64) < Q {
-                    *c = val as i64;
+                let mut candidate_bytes = [0u8; 4];
+                rng.fill_bytes(&mut candidate_bytes);
+                let candidate = u32::from_le_bytes(candidate_bytes) & 0x7F_FFFF;
+                if (candidate as i64) < Q {
+                    *c = candidate as i64;
                     break;
                 }
             }
@@ -228,20 +259,23 @@ impl Poly {
         poly
     }
 
-    /// Sample a masking polynomial with coefficients uniform in [-γ₁+1, γ₁].
+    /// Samples a masking polynomial with coefficients uniform in `[-gamma1 + 1, gamma1]`.
     ///
-    /// The range has width 2·γ₁ = 262,144 values.
+    /// # Randomness
+    ///
+    /// The `rng` parameter must be a cryptographically secure pseudorandom
+    /// number generator. Passing a weak or deterministic RNG breaks the
+    /// security of the output.
     pub fn sample_masking<R: RngCore + CryptoRng + ?Sized>(rng: &mut R) -> Poly {
         let mut poly = Poly::zero();
-        let range = 2 * GAMMA1; // 262,144
+        let range = 2 * GAMMA1;
         for c in poly.coeffs.iter_mut() {
             loop {
-                let mut buf = [0u8; 4];
-                rng.fill_bytes(&mut buf);
-                let val = u32::from_le_bytes(buf) & 0x0003_FFFF; // 18-bit mask
-                if (val as i64) < range {
-                    // Map [0, range) → [-γ₁+1, γ₁]
-                    *c = ((val as i64) - GAMMA1 + 1).rem_euclid(Q);
+                let mut candidate_bytes = [0u8; 4];
+                rng.fill_bytes(&mut candidate_bytes);
+                let candidate = u32::from_le_bytes(candidate_bytes) & 0x0003_FFFF;
+                if (candidate as i64) < range {
+                    *c = ((candidate as i64) - GAMMA1 + 1).rem_euclid(Q);
                     break;
                 }
             }
@@ -249,9 +283,13 @@ impl Poly {
         poly
     }
 
-    /// Serialize polynomial to bytes (little-endian, 3 bytes per coefficient).
+    /// Serializes the polynomial as little-endian 23-bit coefficients.
     ///
-    /// Each coefficient c ∈ [0, q) where q < 2^23, so 3 bytes suffice.
+    /// # Security
+    ///
+    /// Callers must only serialize reduced coefficients when canonical
+    /// encodings are required by a protocol transcript.
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(N * 3);
         for &c in &self.coeffs {
@@ -263,7 +301,14 @@ impl Poly {
         bytes
     }
 
-    /// Deserialize polynomial from bytes (little-endian, 3 bytes per coefficient).
+    /// Deserializes a polynomial from little-endian 23-bit coefficients.
+    ///
+    /// # Untrusted Input
+    ///
+    /// This function accepts data from untrusted sources. All structural
+    /// checks are performed before any arithmetic. Malformed input is
+    /// rejected with `None` rather than panicking.
+    #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != N * 3 {
             return None;
@@ -283,26 +328,61 @@ impl Poly {
     }
 }
 
-// ─── Polynomial Vector ───────────────────────────────────────────────────────
-
-/// A vector of k polynomials in R_q^k.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize)]
+/// Vector of `k` polynomials in `R_q^k`.
+///
+/// This type carries MLWE secret vectors, public key vectors, and proof
+/// responses. Deserialization enforces the module rank `K`; arithmetic assumes
+/// operands already have that rank. Callers must avoid exposing vectors that
+/// contain secret coefficients through debug output or unauthenticated
+/// serialization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Zeroize)]
 pub struct PolyVec {
     /// Component polynomials.
     pub polys: Vec<Poly>,
 }
 
+impl<'de> Deserialize<'de> for PolyVec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct PolyVecRepr {
+            polys: Vec<Poly>,
+        }
+
+        let polys = PolyVecRepr::deserialize(deserializer)?.polys;
+        if polys.len() != K {
+            return Err(serde::de::Error::custom(format!(
+                "expected {} polynomials, got {}",
+                K,
+                polys.len()
+            )));
+        }
+        Ok(PolyVec { polys })
+    }
+}
+
 impl PolyVec {
-    /// Zero vector of dimension k.
+    /// Returns the zero vector of dimension `k`.
+    ///
+    /// # Security
+    ///
+    /// The value carries no entropy and must not be used as a secret vector or mask.
+    #[must_use]
     pub fn zero() -> Self {
         PolyVec {
             polys: vec![Poly::zero(); K],
         }
     }
 
-    /// Component-wise addition of two polynomial vectors.
+    /// Adds two polynomial vectors component-wise.
+    ///
+    /// # Timing
+    ///
+    /// This function is not constant-time with respect to its input.
+    /// Callers on secret data accept a timing side-channel risk.
+    #[must_use]
     pub fn add(&self, other: &PolyVec) -> PolyVec {
-        assert_eq!(self.polys.len(), other.polys.len());
+        debug_assert_eq!(self.polys.len(), K);
+        debug_assert_eq!(other.polys.len(), K);
         PolyVec {
             polys: self
                 .polys
@@ -313,9 +393,16 @@ impl PolyVec {
         }
     }
 
-    /// Component-wise subtraction.
+    /// Subtracts two polynomial vectors component-wise.
+    ///
+    /// # Timing
+    ///
+    /// This function is not constant-time with respect to its input.
+    /// Callers on secret data accept a timing side-channel risk.
+    #[must_use]
     pub fn sub(&self, other: &PolyVec) -> PolyVec {
-        assert_eq!(self.polys.len(), other.polys.len());
+        debug_assert_eq!(self.polys.len(), K);
+        debug_assert_eq!(other.polys.len(), K);
         PolyVec {
             polys: self
                 .polys
@@ -326,16 +413,29 @@ impl PolyVec {
         }
     }
 
-    /// Scalar multiplication: multiply each component by a scalar polynomial.
+    /// Multiplies each vector component by a scalar polynomial.
+    ///
+    /// # Timing
+    ///
+    /// This function is not constant-time with respect to its input.
+    /// Callers on secret data accept a timing side-channel risk.
+    #[must_use]
     pub fn scalar_mul(&self, scalar: &Poly) -> PolyVec {
         PolyVec {
             polys: self.polys.iter().map(|p| p.mul(scalar)).collect(),
         }
     }
 
-    /// Inner product of two vectors: `sum_i self[i] * other[i]`.
+    /// Computes the polynomial inner product `sum_i self[i] * other[i]`.
+    ///
+    /// # Timing
+    ///
+    /// This function is not constant-time with respect to its input.
+    /// Callers on secret data accept a timing side-channel risk.
+    #[must_use]
     pub fn inner_product(&self, other: &PolyVec) -> Poly {
-        assert_eq!(self.polys.len(), other.polys.len());
+        debug_assert_eq!(self.polys.len(), K);
+        debug_assert_eq!(other.polys.len(), K);
         let mut result = Poly::zero();
         for (a, b) in self.polys.iter().zip(&other.polys) {
             result = result.add(&a.mul(b));
@@ -343,7 +443,13 @@ impl PolyVec {
         result
     }
 
-    /// Maximum infinity norm across all component polynomials.
+    /// Computes the maximum infinity norm across component polynomials.
+    ///
+    /// # Timing
+    ///
+    /// This function is not constant-time with respect to its input.
+    /// Callers on secret data accept a timing side-channel risk.
+    #[must_use]
     pub fn infinity_norm(&self) -> i64 {
         self.polys
             .iter()
@@ -352,28 +458,52 @@ impl PolyVec {
             .unwrap_or(0)
     }
 
-    /// Sample a uniform random polynomial vector.
+    /// Samples a uniform random polynomial vector.
+    ///
+    /// # Randomness
+    ///
+    /// The `rng` parameter must be a cryptographically secure pseudorandom
+    /// number generator. Passing a weak or deterministic RNG breaks the
+    /// security of the output.
     pub fn sample_uniform<R: RngCore + CryptoRng + ?Sized>(rng: &mut R) -> PolyVec {
         PolyVec {
             polys: (0..K).map(|_| Poly::sample_uniform(rng)).collect(),
         }
     }
 
-    /// Sample a CBD polynomial vector.
+    /// Samples a centered-binomial polynomial vector.
+    ///
+    /// # Randomness
+    ///
+    /// The `rng` parameter must be a cryptographically secure pseudorandom
+    /// number generator. Passing a weak or deterministic RNG breaks the
+    /// security of the output.
     pub fn sample_cbd<R: RngCore + CryptoRng + ?Sized>(rng: &mut R) -> PolyVec {
         PolyVec {
             polys: (0..K).map(|_| Poly::sample_cbd(rng)).collect(),
         }
     }
 
-    /// Sample a masking polynomial vector.
+    /// Samples a masking polynomial vector.
+    ///
+    /// # Randomness
+    ///
+    /// The `rng` parameter must be a cryptographically secure pseudorandom
+    /// number generator. Passing a weak or deterministic RNG breaks the
+    /// security of the output.
     pub fn sample_masking<R: RngCore + CryptoRng + ?Sized>(rng: &mut R) -> PolyVec {
         PolyVec {
             polys: (0..K).map(|_| Poly::sample_masking(rng)).collect(),
         }
     }
 
-    /// Serialize to bytes.
+    /// Serializes all component polynomials in canonical order.
+    ///
+    /// # Security
+    ///
+    /// Callers must not serialize secret vectors into logs or unauthenticated
+    /// storage. The encoding is deterministic and linkable.
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         for p in &self.polys {
@@ -382,7 +512,14 @@ impl PolyVec {
         bytes
     }
 
-    /// Deserialize from bytes.
+    /// Deserializes a polynomial vector from its byte encoding.
+    ///
+    /// # Untrusted Input
+    ///
+    /// This function accepts data from untrusted sources. All structural
+    /// checks are performed before any arithmetic. Malformed input is
+    /// rejected with `None` rather than panicking.
+    #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let poly_size = N * 3;
         if bytes.len() != K * poly_size {
@@ -398,28 +535,61 @@ impl PolyVec {
     }
 }
 
-// ─── Polynomial Matrix ───────────────────────────────────────────────────────
-
-/// A k × k matrix of polynomials in R_q^{k×k}.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Matrix of polynomials in `R_q^{k x k}`.
+///
+/// This type carries the public Module-LWE parameter matrix used to bind public
+/// keys and proof responses. Matrix values are public protocol parameters and
+/// do not enforce a trusted setup by themselves. Callers must ensure all
+/// parties use the same matrix when producing and verifying proofs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolyMat {
     /// Rows of the matrix. `rows[i]` is the i-th row vector.
     pub rows: Vec<PolyVec>,
 }
 
+impl<'de> Deserialize<'de> for PolyMat {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct PolyMatRepr {
+            rows: Vec<PolyVec>,
+        }
+
+        let rows = PolyMatRepr::deserialize(deserializer)?.rows;
+        if rows.len() != K {
+            return Err(serde::de::Error::custom(format!(
+                "expected {} matrix rows, got {}",
+                K,
+                rows.len()
+            )));
+        }
+        Ok(PolyMat { rows })
+    }
+}
+
 impl PolyMat {
-    /// Generate a uniform random k × k polynomial matrix.
+    /// Samples a uniform random `k x k` polynomial matrix.
+    ///
+    /// # Randomness
+    ///
+    /// The `rng` parameter must be a cryptographically secure pseudorandom
+    /// number generator. Passing a weak or deterministic RNG breaks the
+    /// security of the output.
     pub fn sample_uniform<R: RngCore + CryptoRng + ?Sized>(rng: &mut R) -> PolyMat {
         PolyMat {
             rows: (0..K).map(|_| PolyVec::sample_uniform(rng)).collect(),
         }
     }
 
-    /// Matrix-vector product: A · v, where A is k×k and v is k×1.
+    /// Computes the matrix-vector product `A * v`.
     ///
-    /// Returns a k-by-1 polynomial vector where `result[i] = sum_j A[i][j] * v[j]`.
+    /// # Timing
+    ///
+    /// This function is not constant-time with respect to its input.
+    /// Callers on secret data accept a timing side-channel risk.
+    #[must_use]
     pub fn mul_vec(&self, v: &PolyVec) -> PolyVec {
-        assert_eq!(self.rows.len(), K);
+        debug_assert_eq!(self.rows.len(), K);
+        debug_assert_eq!(v.polys.len(), K);
         PolyVec {
             polys: self.rows.iter().map(|row| row.inner_product(v)).collect(),
         }
@@ -429,11 +599,12 @@ impl PolyMat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     #[test]
     fn test_poly_add_sub_identity() {
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(42);
         let a = Poly::sample_uniform(&mut rng);
         let b = Poly::sample_uniform(&mut rng);
@@ -444,6 +615,7 @@ mod tests {
 
     #[test]
     fn test_poly_mul_commutativity() {
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(43);
         let a = Poly::sample_uniform(&mut rng);
         let b = Poly::sample_uniform(&mut rng);
@@ -452,6 +624,7 @@ mod tests {
 
     #[test]
     fn test_poly_mul_by_zero() {
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(44);
         let a = Poly::sample_uniform(&mut rng);
         let zero = Poly::zero();
@@ -460,6 +633,7 @@ mod tests {
 
     #[test]
     fn test_poly_mul_by_one() {
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(45);
         let a = Poly::sample_uniform(&mut rng);
         let mut one = Poly::zero();
@@ -469,6 +643,7 @@ mod tests {
 
     #[test]
     fn test_cbd_range() {
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(46);
         let p = Poly::sample_cbd(&mut rng);
         for &c in &p.coeffs {
@@ -476,7 +651,7 @@ mod tests {
             // {0, 1, 2, q-2, q-1}.
             let centered = if c > Q_HALF { c - Q } else { c };
             assert!(
-                centered.abs() <= ETA as i64,
+                centered.abs() <= ETA,
                 "CBD coefficient {} out of range [-{}, {}]",
                 centered,
                 ETA,
@@ -487,6 +662,7 @@ mod tests {
 
     #[test]
     fn test_poly_serialization_roundtrip() {
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(47);
         let p = Poly::sample_uniform(&mut rng);
         let bytes = p.to_bytes();
@@ -496,6 +672,7 @@ mod tests {
 
     #[test]
     fn test_polyvec_serialization_roundtrip() {
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(48);
         let v = PolyVec::sample_uniform(&mut rng);
         let bytes = v.to_bytes();
@@ -504,7 +681,28 @@ mod tests {
     }
 
     #[test]
+    fn test_poly_deserialize_rejects_out_of_range_coefficients() {
+        let mut coeffs = vec![0i64; N];
+        coeffs[17] = Q; // simulate a coefficient outside the canonical range
+        let encoded = serde_json::to_vec(&coeffs).unwrap();
+
+        assert!(serde_json::from_slice::<Poly>(&encoded).is_err());
+    }
+
+    #[test]
+    fn test_polyvec_deserialize_rejects_wrong_dimension() {
+        // simulate a payload with the wrong module rank
+        let encoded = serde_json::json!({
+            "polys": [Poly::zero()]
+        })
+        .to_string();
+
+        assert!(serde_json::from_str::<PolyVec>(&encoded).is_err());
+    }
+
+    #[test]
     fn test_matrix_vec_mul_dimensions() {
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(49);
         let a = PolyMat::sample_uniform(&mut rng);
         let v = PolyVec::sample_uniform(&mut rng);
@@ -526,13 +724,11 @@ mod tests {
 
     #[test]
     fn test_negacyclic_reduction() {
-        // X^N ≡ -1 in ℤ_q[X]/(X^256+1)
-        // So X^128 · X^128 = X^256 = -1 (mod X^256+1)
         let mut a = Poly::zero();
-        a.coeffs[128] = 1; // a = X^128
-        let result = a.mul(&a); // X^128 · X^128 = X^256 ≡ -1
+        a.coeffs[128] = 1;
+        let result = a.mul(&a);
         let mut expected = Poly::zero();
-        expected.coeffs[0] = Q - 1; // -1 mod q
+        expected.coeffs[0] = Q - 1;
         assert_eq!(result, expected);
     }
 }

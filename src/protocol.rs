@@ -1,22 +1,10 @@
-//! # Obscura Protocol — Core Lattice-Based ZK Engine
+//! High-level API for Obscura credential authorization.
 //!
-//! Post-quantum proving and verification over Module-LWE using the
-//! Fiat-Shamir with Aborts paradigm. This module provides the high-level
-//! protocol API for key generation, proof creation, and verification.
-//!
-//! ## Architecture
-//!
-//! - **No Trusted Setup**: Unlike Groth16, the lattice-based protocol uses
-//!   public MLWE parameters (a uniform matrix A) that require no multi-party
-//!   ceremony. Parameters can be generated from a public seed.
-//!
-//! - **Proving**: `Prover::generate_proof()` invokes the lattice ZK protocol:
-//!   sample masking vector, compute commitment, derive Fiat-Shamir challenge,
-//!   compute response with rejection sampling.
-//!
-//! - **Verification**: `Verifier::verify_proof()` checks the norm bound,
-//!   challenge consistency, algebraic relation, and Merkle membership.
-//!
+//! This module connects key generation, Merkle membership, proof generation,
+//! verification, and JSON proof serialization. It is designed to reject
+//! malformed proof data without panicking and to expose a compact API for
+//! applications. It does not authenticate Merkle roots, choose deployment
+//! parameter policy, or remove timing side channels in the arithmetic layer.
 use std::fmt;
 
 use rand::{CryptoRng, RngCore};
@@ -27,15 +15,12 @@ use crate::poly::PolyVec;
 use crate::tree::MerkleProof;
 use crate::zk_auth::{self, AuthProof};
 
-// ─── Data Structures ─────────────────────────────────────────────────────────
-
-/// A credential key pair for the post-quantum protocol.
+/// A credential key pair for the protocol.
 ///
-/// Wraps an MLWE key pair:
-/// - `secret_key`: s ∈ R_q^k with small CBD coefficients.
-/// - `public_key`: b = A·s + e mod q.
-///
-/// The commitment `SHAKE-256("COM_DOM" ∥ b)` is inserted into the Merkle tree.
+/// The key pair carries the secret witness used by the prover and the public
+/// key committed into the authorization Merkle tree. Its debug output redacts
+/// the secret key. Callers must keep the key bound to the parameters used at
+/// generation time and must not serialize the secret witness.
 pub struct KeyPair {
     /// The underlying MLWE key pair.
     pub(crate) inner: MlweKeyPair,
@@ -50,7 +35,13 @@ impl fmt::Debug for KeyPair {
     }
 }
 
-/// Public inputs to the ZK proof — visible to both prover and verifier.
+/// Public inputs that bind a proof to a root, scope, and nullifier.
+///
+/// These values define the verifier's statement: membership in the
+/// authorization set identified by `merkle_root`, under the session or
+/// application context in `scope`, with the expected linkability tag
+/// `nullifier`. Callers are responsible for authenticating the Merkle root and
+/// choosing scopes that prevent unintended replay or cross-context linkage.
 #[derive(Debug, Clone)]
 pub struct PublicInputs {
     /// The Merkle root of the anonymity set (32-byte SHAKE-256 hash).
@@ -61,61 +52,86 @@ pub struct PublicInputs {
     pub nullifier: [u8; 32],
 }
 
-// ─── KeyPair Implementation ──────────────────────────────────────────────────
-
 impl KeyPair {
-    /// Generate a new random MLWE key pair.
+    /// Generates a new credential key pair under the supplied parameters.
     ///
-    /// Samples s, e ← CBD(η)^k and computes b = A·s + e mod q.
+    /// # Randomness
+    ///
+    /// The `rng` parameter must be a cryptographically secure pseudorandom
+    /// number generator. Passing a weak or deterministic RNG breaks the
+    /// security of the output.
+    ///
+    /// # Security
+    ///
+    /// The returned key pair is bound to `params`; proofs produced under other
+    /// parameters will not verify.
     pub fn generate<R: RngCore + CryptoRng + ?Sized>(params: &MlweParams, rng: &mut R) -> Self {
         KeyPair {
             inner: mlwe::keygen(params, rng),
         }
     }
 
-    /// Access the secret key vector.
-    pub fn secret_key(&self) -> &PolyVec {
-        &self.inner.secret_key
-    }
-
-    /// Access the public key vector.
+    /// Returns the public key vector for this credential.
+    ///
+    /// # Security
+    ///
+    /// The public key is safe to commit into an authorization set, but it is a
+    /// stable identifier for this key pair.
     pub fn public_key(&self) -> &PolyVec {
-        &self.inner.public_key
+        self.inner.public_key()
     }
 
-    /// Compute the SHAKE-256 commitment hash for this key pair's public key.
+    /// Computes the credential commitment for this key pair.
     ///
-    /// `commitment = SHAKE-256("COM_DOM" ∥ serialize(b))`, 32 bytes.
+    /// # Security
     ///
-    /// This value is inserted as a leaf into the Merkle tree.
+    /// The commitment is deterministic and should be inserted into the Merkle
+    /// authorization set that verifiers trust.
     pub fn commitment(&self) -> [u8; 32] {
-        mlwe::commitment_hash(&self.inner.public_key)
+        self.inner.commitment()
     }
 
-    /// Derive the nullifier for a given scope.
+    /// Derives the nullifier for a given scope.
     ///
-    /// `nullifier = SHAKE-256("NUL_DOM" ∥ serialize(s) ∥ scope)`, 32 bytes.
+    /// # Security
+    ///
+    /// The same key and scope produce the same nullifier. The scope should be
+    /// unique to the verifier context where replay or double-use detection is
+    /// required.
     pub fn nullifier(&self, scope: &[u8]) -> [u8; 32] {
-        zk_auth::derive_nullifier(&self.inner.secret_key, scope)
+        self.inner.nullifier(scope)
     }
 }
 
-// ─── Prover ──────────────────────────────────────────────────────────────────
-
-/// The Prover generates lattice-based ZK proofs of credential set membership.
+/// Prover facade for credential membership proofs.
 ///
-/// The proving protocol uses Fiat-Shamir with Aborts:
-/// 1. Sample masking vector y ← Uniform([-γ₁+1, γ₁])^{k·n}.
-/// 2. Compute commitment w = A · y mod q.
-/// 3. Derive challenge c via SHAKE-256 from the transcript.
-/// 4. Compute response z = y + c·s mod q.
-/// 5. Rejection sampling: abort if ‖z‖∞ ≥ γ₁ - β.
-///
-/// Expected ~4-5 attempts per successful proof due to rejection sampling.
+/// The type has no state; it groups proof-generation APIs around the witness
+/// in [`KeyPair`]. It enforces transcript binding through [`PublicInputs`] and
+/// delegates arithmetic to [`zk_auth`]. Callers must provide a Merkle proof for
+/// the key pair's commitment under the trusted root.
 pub struct Prover;
 
 impl Prover {
-    /// Generate a lattice-based ZK authorization proof.
+    /// Generates a lattice-based authorization proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::ChallengeFailure`] if the supplied public
+    /// nullifier does not match `keypair` and `public_inputs.scope`. Returns
+    /// [`ProtocolError::ProofGenerationFailure`] if rejection sampling does not
+    /// find a bounded response within the configured attempt limit.
+    ///
+    /// # Randomness
+    ///
+    /// The `rng` parameter must be a cryptographically secure pseudorandom
+    /// number generator. Passing a weak or deterministic RNG breaks the
+    /// security of the output.
+    ///
+    /// # Security
+    ///
+    /// `merkle_proof` must prove membership of `keypair.commitment()` under
+    /// `public_inputs.merkle_root`; this function does not verify the path
+    /// before constructing the proof.
     pub fn generate_proof<R: RngCore + CryptoRng + ?Sized>(
         params: &MlweParams,
         keypair: &KeyPair,
@@ -135,24 +151,36 @@ impl Prover {
     }
 }
 
-// ─── Verifier ────────────────────────────────────────────────────────────────
-
-/// The Verifier checks lattice-based ZK proofs.
+/// Verifier facade for credential authorization proofs.
 ///
-/// Verification checks:
-/// 1. ‖z‖∞ < γ₁ - β (response norm bound).
-/// 2. Challenge consistency (recomputed from transcript).
-/// 3. Algebraic relation: ‖A·z - w - c·b‖∞ < τ·η·n + 1.
-/// 4. Merkle membership (commitment hash ↔ root).
-///
-/// Verification cost is proportional to the included Merkle path length.
+/// The type has no state; it groups proof verification against caller-supplied
+/// parameters and public inputs. It rejects malformed serialized proof
+/// structure with `Ok(false)` through the lower-level verifier. Callers must
+/// authenticate the root and parameter set before accepting a positive result.
 pub struct Verifier;
 
 impl Verifier {
-    /// Verify a lattice-based ZK authorization proof.
+    /// Verifies a lattice-based authorization proof.
     ///
-    /// Returns `Ok(true)` if the proof is valid, `Ok(false)` if it fails
-    /// any verification check.
+    /// Returns `Ok(true)` if all checks pass and `Ok(false)` if the proof fails
+    /// a structural, transcript, algebraic, or Merkle-membership check.
+    ///
+    /// # Errors
+    ///
+    /// This function currently returns verification failures as `Ok(false)`.
+    /// It reserves [`ProtocolError`] for future structural failures that
+    /// prevent verification from running.
+    ///
+    /// # Untrusted Input
+    ///
+    /// This function accepts data from untrusted sources. All structural
+    /// checks are performed before any arithmetic. Malformed input is
+    /// rejected with `Ok(false)` rather than panicking.
+    ///
+    /// # Security
+    ///
+    /// `public_inputs.merkle_root` must come from a trusted source, and
+    /// `params` must be the parameter set used by the prover.
     pub fn verify_proof(
         params: &MlweParams,
         proof: &AuthProof,
@@ -168,14 +196,40 @@ impl Verifier {
     }
 }
 
-/// Serialize an AuthProof to JSON bytes.
+/// Serializes an authorization proof to JSON bytes.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError::SerializationError`] if `serde_json` cannot encode
+/// the proof.
+///
+/// # Security
+///
+/// Serialized proofs are public verification artifacts, but they may be
+/// linkable through their nullifier and Merkle path.
 pub fn serialize_proof(proof: &AuthProof) -> Result<Vec<u8>, ProtocolError> {
     serde_json::to_vec(proof).map_err(|e| ProtocolError::SerializationError {
         reason: e.to_string(),
     })
 }
 
-/// Deserialize an AuthProof from JSON bytes.
+/// Deserializes an authorization proof from JSON bytes.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError::SerializationError`] if the byte slice is not a
+/// valid proof encoding or contains invalid polynomial structure.
+///
+/// # Untrusted Input
+///
+/// This function accepts data from untrusted sources. Structural checks are
+/// performed by serde and nested deserializers before an [`AuthProof`] is
+/// returned.
+///
+/// # Security
+///
+/// Deserialization alone does not validate the proof. Call
+/// [`Verifier::verify_proof`] before accepting the result.
 pub fn deserialize_proof(bytes: &[u8]) -> Result<AuthProof, ProtocolError> {
     serde_json::from_slice(bytes).map_err(|e| ProtocolError::SerializationError {
         reason: e.to_string(),
@@ -186,30 +240,27 @@ pub fn deserialize_proof(bytes: &[u8]) -> Result<AuthProof, ProtocolError> {
 mod tests {
     use super::*;
     use crate::tree::MerkleTree;
-    use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     #[test]
     fn test_full_lattice_zk_flow() {
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(42);
 
-        // Generate MLWE parameters (public matrix A).
         let params = MlweParams::generate(&mut rng);
 
-        // Build anonymity set.
         let mut tree = MerkleTree::new();
         for _ in 0..3 {
             let dummy = KeyPair::generate(&params, &mut rng);
             tree.insert(dummy.commitment()).unwrap();
         }
 
-        // Register user.
         let user = KeyPair::generate(&params, &mut rng);
         let user_idx = tree.insert(user.commitment()).unwrap();
         let root = tree.root().unwrap();
         let merkle_proof = tree.generate_inclusion_proof(user_idx).unwrap();
 
-        // Challenge + nullifier.
         let scope = b"session_challenge_xyz".to_vec();
         let nullifier = user.nullifier(&scope);
         let public_inputs = PublicInputs {
@@ -218,17 +269,16 @@ mod tests {
             nullifier,
         };
 
-        // Prove.
         let proof = Prover::generate_proof(&params, &user, &merkle_proof, &public_inputs, &mut rng)
             .unwrap();
 
-        // Verify.
         let valid = Verifier::verify_proof(&params, &proof, &public_inputs).unwrap();
         assert!(valid, "Valid proof must pass verification");
     }
 
     #[test]
     fn test_serialization_roundtrip() {
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(43);
         let params = MlweParams::generate(&mut rng);
 
@@ -249,17 +299,16 @@ mod tests {
         let proof = Prover::generate_proof(&params, &user, &merkle_proof, &public_inputs, &mut rng)
             .unwrap();
 
-        // Serialize and deserialize.
         let bytes = serialize_proof(&proof).unwrap();
         let recovered = deserialize_proof(&bytes).unwrap();
 
-        // Verify the recovered proof.
         let valid = Verifier::verify_proof(&params, &recovered, &public_inputs).unwrap();
         assert!(valid, "Deserialized proof must still verify");
     }
 
     #[test]
     fn test_wrong_scope_rejected() {
+        // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(44);
         let params = MlweParams::generate(&mut rng);
 
@@ -280,7 +329,6 @@ mod tests {
         let proof = Prover::generate_proof(&params, &user, &merkle_proof, &public_inputs, &mut rng)
             .unwrap();
 
-        // Verify with wrong scope.
         let wrong_inputs = PublicInputs {
             merkle_root: root,
             scope: b"wrong_scope".to_vec(),

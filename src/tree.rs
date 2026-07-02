@@ -1,30 +1,16 @@
-//! # Obscura Protocol — Merkle Tree (Anonymity Set)
+//! Merkle authorization set for credential commitments.
 //!
-//! SHAKE-256-based binary Merkle tree over 32-byte hash digests.
-//!
-//! Each leaf is the commitment hash of a user's MLWE public key. The tree
-//! root serves as a compact, tamper-evident digest of the anonymity set.
-//!
-//! ## Post-Quantum Design
-//!
-//! This tree uses SHAKE-256 (a member of the SHA-3 family) which provides
-//! quantum-resistant collision resistance. The hash function is a standard
-//! XOF (Extendable Output Function) from NIST FIPS 202.
-//!
-//! ## Domain Separation
-//!
-//! - **Leaf hash**: `SHAKE-256("COM_DOM" ∥ leaf_data)` — the domain prefix
-//!   separates leaves from internal nodes, preventing second-preimage attacks.
-//! - **Internal node hash**: `SHAKE-256("NODE_DOM" ∥ left ∥ right)` — standard
-//!   2-to-1 hash with its own domain separator.
+//! This module implements a SHAKE-256 binary Merkle tree over 32-byte
+//! credential commitment hashes. It is designed to detect tampering with
+//! inclusion paths when the verifier obtains the root from a trusted source. It
+//! does not hide the tree size, protect against an adversary-chosen root, or
+//! provide side-channel resistance for local proof processing.
 
 use serde::{Deserialize, Serialize};
-use sha3::Shake256;
 use sha3::digest::{ExtendableOutput, Update, XofReader};
+use sha3::Shake256;
 
 use crate::error::ProtocolError;
-
-// ─── Constants ───────────────────────────────────────────────────────────────
 
 /// Domain separator for leaf hashing.
 const LEAF_DOMAIN: &[u8] = b"COM_DOM";
@@ -34,8 +20,6 @@ const NODE_DOMAIN: &[u8] = b"NODE_DOM";
 
 /// Zero hash (32 bytes of zeros) used for padding empty leaf slots.
 const ZERO_HASH: [u8; 32] = [0u8; 32];
-
-// ─── Hash Functions ──────────────────────────────────────────────────────────
 
 /// Domain-separated leaf hash: SHAKE-256("COM_DOM" ∥ leaf_data), 32 bytes.
 fn hash_leaf(data: &[u8; 32]) -> [u8; 32] {
@@ -58,18 +42,28 @@ fn hash_node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     output
 }
 
-// ─── Structs ─────────────────────────────────────────────────────────────────
-
 /// A binary Merkle tree over SHAKE-256-hashed 32-byte digests.
+///
+/// The tree accumulates credential commitments into a compact authorization
+/// root. It enforces deterministic domain-separated hashing for leaves and
+/// internal nodes, but it does not authenticate the root for callers. Verifiers
+/// must obtain the root from a trusted channel before accepting membership
+/// proofs.
 #[derive(Debug, Clone)]
 pub struct MerkleTree {
     /// Raw leaf values (commitment hashes) as inserted by callers.
-    pub leaves: Vec<[u8; 32]>,
+    leaves: Vec<[u8; 32]>,
     /// Flattened binary tree array. Index 0 is unused (sentinel), index 1 is root.
     nodes: Vec<[u8; 32]>,
 }
 
-/// A Merkle inclusion proof for a specific leaf.
+/// Merkle inclusion proof for a credential commitment.
+///
+/// Verifying this proof against a trusted root confirms that the committed
+/// credential was included in the authorization set used to build that root.
+/// The proof reveals the path length and left/right position bits. Callers must
+/// reject roots supplied by adversaries, because membership is only meaningful
+/// relative to the chosen root.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MerkleProof {
     /// The raw leaf value whose membership is being proven.
@@ -82,17 +76,22 @@ pub struct MerkleProof {
     pub root: [u8; 32],
 }
 
-// ─── Helper ──────────────────────────────────────────────────────────────────
-
 /// Smallest power of two ≥ n.
 fn next_power_of_two(n: usize) -> usize {
-    if n == 0 { 1 } else { n.next_power_of_two() }
+    if n == 0 {
+        1
+    } else {
+        n.next_power_of_two()
+    }
 }
-
-// ─── MerkleTree Implementation ───────────────────────────────────────────────
 
 impl MerkleTree {
     /// Create a new, empty Merkle tree.
+    ///
+    /// # Security
+    ///
+    /// An empty tree has no authorization root. Callers must insert at least
+    /// one credential commitment before requesting a root or proof.
     pub fn new() -> Self {
         MerkleTree {
             leaves: Vec::new(),
@@ -100,14 +99,43 @@ impl MerkleTree {
         }
     }
 
-    /// Insert a leaf (commitment hash) into the tree.
+    /// Inserts a credential commitment hash into the tree.
     ///
-    /// The leaf should be the output of `commitment_hash()` from the MLWE module.
+    /// # Errors
+    ///
+    /// This function currently has no error path and returns `Ok(index)` for
+    /// API consistency with fallible tree operations.
+    ///
+    /// # Security
+    ///
+    /// The leaf should be the output of the crate's credential commitment
+    /// function. Inserting arbitrary values is allowed but only proves
+    /// membership of those values.
     pub fn insert(&mut self, leaf: [u8; 32]) -> Result<usize, ProtocolError> {
         let index = self.leaves.len();
         self.leaves.push(leaf);
-        self.nodes.clear(); // invalidate cached tree
+        self.nodes.clear();
         Ok(index)
+    }
+
+    /// Returns the inserted raw leaf values.
+    ///
+    /// # Security
+    ///
+    /// The returned values are public commitments, but they may still be
+    /// linkable across authorization sets.
+    pub fn leaves(&self) -> &[[u8; 32]] {
+        &self.leaves
+    }
+
+    /// Returns the number of inserted leaves.
+    ///
+    /// # Security
+    ///
+    /// The count can reveal authorization-set size. Do not expose it where set
+    /// size is intended to remain private.
+    pub fn leaf_count(&self) -> usize {
+        self.leaves.len()
     }
 
     /// Build the flattened binary tree array from current leaves.
@@ -139,7 +167,17 @@ impl MerkleTree {
         Ok(())
     }
 
-    /// Compute and return the Merkle root as a 32-byte hash.
+    /// Computes and returns the Merkle root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::EmptyTree`] if no leaves have been inserted.
+    ///
+    /// # Security
+    ///
+    /// The returned root must be distributed through an authenticated channel.
+    /// A verifier that accepts an adversary-controlled root accepts membership
+    /// in the adversary's authorization set.
     pub fn root(&mut self) -> Result<[u8; 32], ProtocolError> {
         if self.leaves.is_empty() {
             return Err(ProtocolError::EmptyTree);
@@ -150,7 +188,11 @@ impl MerkleTree {
         Ok(self.nodes[1])
     }
 
-    /// Return the depth of the tree.
+    /// Returns the depth of the padded binary tree.
+    ///
+    /// # Security
+    ///
+    /// Tree depth reveals a bound on the number of inserted commitments.
     pub fn depth(&self) -> usize {
         if self.leaves.is_empty() {
             return 0;
@@ -158,7 +200,18 @@ impl MerkleTree {
         next_power_of_two(self.leaves.len()).trailing_zeros() as usize
     }
 
-    /// Generate a Merkle inclusion proof for the leaf at `leaf_index`.
+    /// Generates a Merkle inclusion proof for the leaf at `leaf_index`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::InvalidLeafIndex`] if `leaf_index` is outside
+    /// the inserted leaf range. Returns [`ProtocolError::EmptyTree`] if the
+    /// tree must be built but contains no leaves.
+    ///
+    /// # Security
+    ///
+    /// The proof is bound to the root currently computed by this tree. Callers
+    /// must send or store the matching root with the proof.
     pub fn generate_inclusion_proof(
         &mut self,
         leaf_index: usize,
@@ -182,14 +235,15 @@ impl MerkleTree {
         let mut current_index = num_leaves + leaf_index;
 
         for _ in 0..depth {
-            let sibling_index = if current_index.is_multiple_of(2) {
+            let is_left_child = current_index % 2 == 0;
+            let sibling_index = if is_left_child {
                 current_index + 1
             } else {
                 current_index - 1
             };
 
             siblings.push(self.nodes[sibling_index]);
-            path_indices.push(!current_index.is_multiple_of(2)); // true if right child
+            path_indices.push(!is_left_child);
 
             current_index /= 2;
         }
@@ -202,10 +256,19 @@ impl MerkleTree {
         })
     }
 
-    /// Verify a Merkle inclusion proof (static utility).
+    /// Verifies a Merkle inclusion proof against its embedded root.
     ///
-    /// Recomputes the root from the leaf and sibling path, then checks
-    /// if it matches the claimed root in the proof.
+    /// # Untrusted Input
+    ///
+    /// This function accepts data from untrusted sources. All structural
+    /// checks are performed before any arithmetic. Malformed input is
+    /// rejected with `false` rather than panicking.
+    ///
+    /// # Security
+    ///
+    /// A `true` result only means the path reconstructs `proof.root`. The caller
+    /// must compare that root with an authenticated authorization root before
+    /// accepting membership.
     pub fn verify_inclusion_proof(proof: &MerkleProof) -> bool {
         if proof.siblings.len() != proof.path_indices.len() {
             return false;
@@ -215,10 +278,8 @@ impl MerkleTree {
 
         for (sibling, is_right_child) in proof.siblings.iter().zip(&proof.path_indices) {
             if !is_right_child {
-                // Current was left child.
                 current = hash_node(&current, sibling);
             } else {
-                // Current was right child.
                 current = hash_node(sibling, &current);
             }
         }
@@ -294,7 +355,7 @@ mod tests {
         }
 
         let mut proof = tree.generate_inclusion_proof(0).unwrap();
-        proof.leaf = random_leaf(99); // tamper
+        proof.leaf = random_leaf(99); // simulate a substituted commitment leaf
         assert!(!MerkleTree::verify_inclusion_proof(&proof));
     }
 
@@ -306,7 +367,7 @@ mod tests {
         }
 
         let mut proof = tree.generate_inclusion_proof(0).unwrap();
-        proof.path_indices.pop();
+        proof.path_indices.pop(); // simulate a truncated network payload
 
         assert!(!MerkleTree::verify_inclusion_proof(&proof));
     }

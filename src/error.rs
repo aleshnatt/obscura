@@ -1,13 +1,20 @@
-//! # Obscura Protocol — Error Definitions
+//! Error taxonomy for Obscura protocol operations.
 //!
-//! Comprehensive error taxonomy for the post-quantum Obscura protocol engine.
+//! This module does not implement cryptographic checks itself. It records the
+//! structural, serialization, and verification failures emitted by modules that
+//! process untrusted Merkle proofs, transcript data, and proof encodings.
 
 use thiserror::Error;
 
-/// Unified error type for all Obscura protocol operations.
-#[derive(Debug, Error)]
+/// Error type returned by fallible Obscura APIs.
+///
+/// Each variant separates structural failure from verification failure so
+/// callers can distinguish malformed input, empty authorization sets, and
+/// failed cryptographic checks. The enum does not carry secret key material.
+/// Callers should avoid reflecting detailed error strings to untrusted peers
+/// when protocol behavior must remain uniform.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ProtocolError {
-    // ─── Merkle Tree Errors ──────────────────────────────────────────────
     /// The Merkle tree contains no leaves.
     #[error(
         "Merkle tree error: tree is empty — at least one leaf must be inserted before computing the root"
@@ -24,7 +31,6 @@ pub enum ProtocolError {
     #[error("Merkle tree error: tree construction failure — {reason}")]
     TreeConstructionFailure { reason: String },
 
-    // ─── Proof Errors ────────────────────────────────────────────────────
     /// The prover could not generate a valid ZK proof.
     #[error("Proof generation error: failed to generate lattice ZK proof — {reason}")]
     ProofGenerationFailure { reason: String },
@@ -41,7 +47,6 @@ pub enum ProtocolError {
     )]
     CommitmentMismatch,
 
-    // ─── Verification Errors ─────────────────────────────────────────────
     /// The ZK proof failed lattice-based verification.
     #[error("Verification error: invalid lattice ZK proof — algebraic relation check failed")]
     InvalidProof,
@@ -60,12 +65,10 @@ pub enum ProtocolError {
     #[error("Verification error: response norm bound exceeded — ‖z‖∞ ≥ γ₁ - β")]
     NormBoundExceeded,
 
-    // ─── Serialization Errors ────────────────────────────────────────────
     /// Proof serialization or deserialization failed.
     #[error("Serialization error: {reason}")]
     SerializationError { reason: String },
 
-    // ─── Generic Cryptographic Errors ────────────────────────────────────
     /// A low-level cryptographic operation failed.
     #[error("Cryptographic error: {reason}")]
     CryptoError { reason: String },

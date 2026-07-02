@@ -1,22 +1,28 @@
 # Obscura
 
-Obscura is a Rust library for lattice-based credential authorization. It combines Module-LWE-style key material, Fiat-Shamir-style transcript challenges, SHAKE-256 commitments, and a Merkle membership path over credential commitments.
+Obscura provides lattice-based credential authorization with Merkle membership proofs for applications that need scoped credential checks without exposing the credential secret.
 
-The API is designed for applications that need credential commitments, scoped nullifiers, and verifiable membership against a compact Merkle root.
+[![Crates.io](https://img.shields.io/crates/v/obscura.svg)](https://crates.io/crates/obscura) [![docs.rs](https://docs.rs/obscura/badge.svg)](https://docs.rs/obscura) [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-## Status
+## What This Crate Does
 
-- Library-first Rust crate.
-- SHAKE-256 domain-separated commitments and Merkle nodes.
-- Module-LWE-style key generation and proof relation checks.
-- JSON proof serialization helpers.
-- End-to-end quickstart under `examples/quickstart.rs`.
+Obscura models a credential as Module-LWE-style key material. The public key is committed into a SHAKE-256 Merkle tree, while the secret key remains with the credential holder. A verifier accepts authorization only when a proof binds the public key, the Merkle root, a verifier-chosen scope, and a scope-bound nullifier.
+
+The crate is useful for systems that need a compact authorization root and a public verification artifact. The Merkle tree represents the credential set, the nullifier supports replay or double-use detection within a scope, and the proof relation checks that the response is consistent with the committed key material.
+
+The implementation exposes a high-level API for generating parameters, creating credential keys, building the authorization set, producing a proof, verifying a proof, and serializing proof objects for transport.
+
+## Security Notice
+Known limitations:
+- Polynomial arithmetic, coefficient comparisons, and norm checks are not constant-time.
+- The proof construction and parameter choices require independent cryptographic review before deployment.
+- Merkle roots and parameter seeds must be authenticated by the application; the crate does not establish trust in those values.
+- Serialized proofs are public verification artifacts, but nullifiers and Merkle paths can be linkable across repeated use.
 
 ## Quick Start
 
 ```rust
 use rand::rngs::OsRng;
-
 use obscura::mlwe::MlweParams;
 use obscura::protocol::{KeyPair, Prover, PublicInputs, Verifier};
 use obscura::tree::MerkleTree;
@@ -24,51 +30,33 @@ use obscura::tree::MerkleTree;
 fn main() -> Result<(), obscura::error::ProtocolError> {
     let mut rng = OsRng;
     let params = MlweParams::generate(&mut rng);
-
     let mut tree = MerkleTree::new();
     let user = KeyPair::generate(&params, &mut rng);
-    let user_index = tree.insert(user.commitment())?;
+    let index = tree.insert(user.commitment())?;
     let root = tree.root()?;
-    let merkle_proof = tree.generate_inclusion_proof(user_index)?;
-
+    let path = tree.generate_inclusion_proof(index)?;
     let scope = b"session-challenge".to_vec();
-    let public_inputs = PublicInputs {
-        merkle_root: root,
-        scope: scope.clone(),
-        nullifier: user.nullifier(&scope),
-    };
-
-    let proof = Prover::generate_proof(
-        &params,
-        &user,
-        &merkle_proof,
-        &public_inputs,
-        &mut rng,
-    )?;
-
-    assert!(Verifier::verify_proof(&params, &proof, &public_inputs)?);
+    let inputs = PublicInputs { merkle_root: root, scope: scope.clone(), nullifier: user.nullifier(&scope) };
+    let proof = Prover::generate_proof(&params, &user, &path, &inputs, &mut rng)?;
+    assert!(Verifier::verify_proof(&params, &proof, &inputs)?);
     Ok(())
 }
 ```
 
-Run the bundled quickstart:
+## Parameter Sets
+
+| Name | Security Target | Key Fields |
+| --- | --- | --- |
+| `default` | targets ~128-bit classical security, subject to independent review | `n = 256`, `q = 8,380,417`, `k = 2`, `eta = 2`, `tau = 39` |
+
+## Building and Testing
 
 ```sh
-cargo run --example quickstart
-```
-
-## Verification Gates
-
-Before publishing a release, run:
-
-```sh
+cargo build --release
 cargo test --all-features
-cargo clippy --all-targets --all-features -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-cargo package --list
-cargo publish --dry-run
+cargo test --doc
 ```
 
 ## License
 
-MIT
+MIT OR Apache-2.0.

@@ -1,15 +1,18 @@
 [package]
 name = "obscura"
 version = "0.1.0"
-edition = "2024"
-authors = ["Naufal Ziyaadaturrahman"]
-description = "Lattice-based credential authorization with Module-LWE-style proofs and SHAKE-256 Merkle membership."
-license = "MIT"
+edition = "2021"
+rust-version = "1.70"
+authors = ["Naufal Ziyaadaturrahman <naufal@aleshnatt.com>"]
+description = "Lattice-based credential authorization with Merkle membership proofs."
+license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/aleshnatt/obscura"
-keywords = ["webauthn", "fido2", "zero-knowledge", "privacy", "lattice"]
-categories = ["cryptography", "authentication"]
-exclude = [".DS_Store"]
+homepage = "https://github.com/aleshnatt/obscura"
+documentation = "https://docs.rs/obscura"
+keywords = ["credentials", "authorization", "lattice", "merkle", "privacy"]
+categories = ["cryptography"]
+exclude = ["paper/", "whitepaper/", ".github/", ".DS_Store", "scratch.rs", "Cargo.lock"]
 
 [dependencies]
 sha3 = "0.10"
