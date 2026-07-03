@@ -9,7 +9,7 @@
 //! ```rust
 //! use rand::rngs::OsRng;
 //! use obscura::mlwe::MlweParams;
-//! use obscura::protocol::{KeyPair, Prover, PublicInputs, Verifier};
+//! use obscura::protocol::{AuthenticatedRoot, KeyPair, Prover, PublicInputs, Verifier};
 //! use obscura::tree::MerkleTree;
 //!
 //! # fn main() -> Result<(), obscura::error::ProtocolError> {
@@ -21,7 +21,8 @@
 //! let root = tree.root()?;
 //! let proof_path = tree.generate_inclusion_proof(index)?;
 //! let scope = b"session".to_vec();
-//! let inputs = PublicInputs { merkle_root: root, scope: scope.clone(), nullifier: user.nullifier(&scope) };
+//! let authenticated_root = AuthenticatedRoot::from_trusted_source(root, &params);
+//! let inputs = PublicInputs::new_authenticated(authenticated_root, scope.clone(), user.nullifier(&scope));
 //! let proof = Prover::generate_proof(&params, &user, &proof_path, &inputs, &mut rng)?;
 //! assert!(Verifier::verify_proof(&params, &proof, &inputs)?);
 //! # Ok(()) }

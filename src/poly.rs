@@ -3,9 +3,8 @@
 //! This module implements arithmetic in `R_q = Z_q[X] / (X^256 + 1)` for
 //! Module-LWE-style keys, responses, and verifier relations. It is intended to
 //! resist malformed coefficient encodings by rejecting out-of-range serialized
-//! data before arithmetic is performed. It does not protect against timing
-//! side channels; norm checks, comparisons, and schoolbook multiplication have
-//! data-dependent execution paths.
+//! data before arithmetic is performed. Arithmetic and norm-bound checks run
+//! over fixed dimensions without secret-dependent early exits.
 
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -39,13 +38,63 @@ pub const GAMMA1: i64 = 1 << 17;
 /// coefficients are bounded by eta.
 pub const BETA: i64 = (TAU as i64) * ETA;
 
+#[inline]
+fn ct_mask_from_bool(bit: u64) -> i64 {
+    0i64.wrapping_sub((bit & 1) as i64)
+}
+
+#[inline]
+fn ct_is_negative(value: i64) -> i64 {
+    ct_mask_from_bool(((value as u64) >> 63) & 1)
+}
+
+#[inline]
+fn ct_select_i64(a: i64, b: i64, mask: i64) -> i64 {
+    (a & !mask) | (b & mask)
+}
+
+#[inline]
+fn ct_ge_i64(a: i64, b: i64) -> i64 {
+    let diff = (a as i128) - (b as i128);
+    let lt = ((diff >> 127) & 1) as u64;
+    ct_mask_from_bool(lt ^ 1)
+}
+
+#[inline]
+fn ct_abs_i64(value: i64) -> i64 {
+    let mask = ct_is_negative(value);
+    (value ^ mask).wrapping_sub(mask)
+}
+
+#[inline]
+fn add_mod_q(a: i64, b: i64) -> i64 {
+    let sum = a + b;
+    sum - (Q & ct_ge_i64(sum, Q))
+}
+
+#[inline]
+fn sub_mod_q(a: i64, b: i64) -> i64 {
+    let diff = a - b;
+    diff + (Q & ct_is_negative(diff))
+}
+
+#[inline]
+fn centered_coeff(c: i64) -> i64 {
+    ct_select_i64(c, c - Q, ct_ge_i64(c, Q_HALF + 1))
+}
+
+#[inline]
+fn ct_max_i64(a: i64, b: i64) -> i64 {
+    ct_select_i64(a, b, ct_ge_i64(b, a + 1))
+}
+
 /// Polynomial element in `R_q = Z_q[X] / (X^256 + 1)`.
 ///
 /// This type carries coefficient data used in public keys, secret keys,
 /// masking vectors, challenges, and verifier relations. The type enforces the
 /// fixed ring dimension; deserialization additionally enforces coefficients in
-/// `[0, q)`. Callers that place secrets in a `Poly` must account for the
-/// non-constant-time arithmetic and comparison routines in this module.
+/// `[0, q)`. Operations traverse the full ring dimension and avoid
+/// value-dependent branches in arithmetic and norm checks.
 #[derive(Debug, Clone, PartialEq, Eq, Zeroize)]
 pub struct Poly {
     /// 256 coefficients representing a₀ + a₁X + a₂X² + ... + a₂₅₅X²⁵⁵.
@@ -105,8 +154,8 @@ impl Poly {
     ///
     /// # Timing
     ///
-    /// This function is not constant-time with respect to its input.
-    /// Callers on secret data accept a timing side-channel risk.
+    /// This function uses Euclidean division and should not be used as the
+    /// primary reduction step for secret arithmetic paths.
     pub fn reduce(&mut self) {
         for c in self.coeffs.iter_mut() {
             *c = c.rem_euclid(Q);
@@ -117,32 +166,45 @@ impl Poly {
     ///
     /// # Timing
     ///
-    /// This function is not constant-time with respect to its input.
-    /// Callers on secret data accept a timing side-channel risk.
+    /// This function scans every coefficient and uses branch-free comparisons
+    /// for the centered absolute value and maximum update.
     #[must_use]
     pub fn infinity_norm(&self) -> i64 {
         let mut max = 0i64;
         for &c in &self.coeffs {
-            let centered = if c > Q_HALF { c - Q } else { c };
-            let abs = centered.abs();
-            if abs > max {
-                max = abs;
-            }
+            let abs = ct_abs_i64(centered_coeff(c));
+            max = ct_max_i64(max, abs);
         }
         max
+    }
+
+    /// Returns true when the centered infinity norm is strictly below `bound`.
+    ///
+    /// # Timing
+    ///
+    /// This function always scans all coefficients and accumulates the bound
+    /// decision without early exit.
+    #[must_use]
+    pub fn infinity_norm_lt(&self, bound: i64) -> bool {
+        let mut ok_mask = -1i64;
+        for &c in &self.coeffs {
+            let abs = ct_abs_i64(centered_coeff(c));
+            ok_mask &= ct_ge_i64(bound - 1, abs);
+        }
+        ok_mask == -1
     }
 
     /// Adds two polynomials in `R_q`.
     ///
     /// # Timing
     ///
-    /// This function is not constant-time with respect to its input.
-    /// Callers on secret data accept a timing side-channel risk.
+    /// This function has a fixed loop count and branch-free modular
+    /// correction for canonical coefficients.
     #[must_use]
     pub fn add(&self, other: &Poly) -> Poly {
         let mut result = Poly::zero();
         for i in 0..N {
-            result.coeffs[i] = (self.coeffs[i] + other.coeffs[i]).rem_euclid(Q);
+            result.coeffs[i] = add_mod_q(self.coeffs[i], other.coeffs[i]);
         }
         result
     }
@@ -151,13 +213,13 @@ impl Poly {
     ///
     /// # Timing
     ///
-    /// This function is not constant-time with respect to its input.
-    /// Callers on secret data accept a timing side-channel risk.
+    /// This function has a fixed loop count and branch-free modular
+    /// correction for canonical coefficients.
     #[must_use]
     pub fn sub(&self, other: &Poly) -> Poly {
         let mut result = Poly::zero();
         for i in 0..N {
-            result.coeffs[i] = (self.coeffs[i] - other.coeffs[i]).rem_euclid(Q);
+            result.coeffs[i] = sub_mod_q(self.coeffs[i], other.coeffs[i]);
         }
         result
     }
@@ -169,20 +231,15 @@ impl Poly {
     ///
     /// # Timing
     ///
-    /// This function is not constant-time with respect to its input.
-    /// Callers on secret data accept a timing side-channel risk.
+    /// This function performs the same multiply-accumulate work regardless of
+    /// coefficient values. The negacyclic wrap branch depends only on public
+    /// loop indices.
     #[must_use]
     pub fn mul(&self, other: &Poly) -> Poly {
         let mut product_coeffs = [0i128; N];
 
         for i in 0..N {
-            if self.coeffs[i] == 0 {
-                continue;
-            }
             for j in 0..N {
-                if other.coeffs[j] == 0 {
-                    continue;
-                }
                 let product = (self.coeffs[i] as i128) * (other.coeffs[j] as i128);
                 let idx = i + j;
                 if idx < N {
@@ -377,8 +434,7 @@ impl PolyVec {
     ///
     /// # Timing
     ///
-    /// This function is not constant-time with respect to its input.
-    /// Callers on secret data accept a timing side-channel risk.
+    /// This function dispatches to fixed-dimension polynomial addition.
     #[must_use]
     pub fn add(&self, other: &PolyVec) -> PolyVec {
         debug_assert_eq!(self.polys.len(), K);
@@ -397,8 +453,7 @@ impl PolyVec {
     ///
     /// # Timing
     ///
-    /// This function is not constant-time with respect to its input.
-    /// Callers on secret data accept a timing side-channel risk.
+    /// This function dispatches to fixed-dimension polynomial subtraction.
     #[must_use]
     pub fn sub(&self, other: &PolyVec) -> PolyVec {
         debug_assert_eq!(self.polys.len(), K);
@@ -417,8 +472,8 @@ impl PolyVec {
     ///
     /// # Timing
     ///
-    /// This function is not constant-time with respect to its input.
-    /// Callers on secret data accept a timing side-channel risk.
+    /// This function dispatches to fixed-work polynomial multiplication for
+    /// every vector component.
     #[must_use]
     pub fn scalar_mul(&self, scalar: &Poly) -> PolyVec {
         PolyVec {
@@ -430,8 +485,8 @@ impl PolyVec {
     ///
     /// # Timing
     ///
-    /// This function is not constant-time with respect to its input.
-    /// Callers on secret data accept a timing side-channel risk.
+    /// This function performs the same number of component products for
+    /// fixed-rank vectors.
     #[must_use]
     pub fn inner_product(&self, other: &PolyVec) -> Poly {
         debug_assert_eq!(self.polys.len(), K);
@@ -447,15 +502,29 @@ impl PolyVec {
     ///
     /// # Timing
     ///
-    /// This function is not constant-time with respect to its input.
-    /// Callers on secret data accept a timing side-channel risk.
+    /// This function scans all component polynomials without early exit.
     #[must_use]
     pub fn infinity_norm(&self) -> i64 {
-        self.polys
-            .iter()
-            .map(|p| p.infinity_norm())
-            .max()
-            .unwrap_or(0)
+        let mut max = 0i64;
+        for poly in &self.polys {
+            max = ct_max_i64(max, poly.infinity_norm());
+        }
+        max
+    }
+
+    /// Returns true when every component polynomial is below `bound`.
+    ///
+    /// # Timing
+    ///
+    /// This function evaluates all component polynomials and accumulates the
+    /// bound decision without short-circuiting.
+    #[must_use]
+    pub fn infinity_norm_lt(&self, bound: i64) -> bool {
+        let mut ok = true;
+        for poly in &self.polys {
+            ok &= poly.infinity_norm_lt(bound);
+        }
+        ok
     }
 
     /// Samples a uniform random polynomial vector.
@@ -584,8 +653,7 @@ impl PolyMat {
     ///
     /// # Timing
     ///
-    /// This function is not constant-time with respect to its input.
-    /// Callers on secret data accept a timing side-channel risk.
+    /// This function has fixed work for valid `k x k` matrices and vectors.
     #[must_use]
     pub fn mul_vec(&self, v: &PolyVec) -> PolyVec {
         debug_assert_eq!(self.rows.len(), K);

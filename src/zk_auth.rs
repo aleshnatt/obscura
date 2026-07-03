@@ -1,11 +1,11 @@
 //! Fiat-Shamir-style authorization proofs over Module-LWE key material.
 //!
-//! This module binds a credential public key, a scope-bound nullifier, and a
-//! Merkle membership proof into one verification statement. It is designed to
-//! reject malformed proof objects without panicking and to resist a
+//! This module binds a credential commitment, a scope-bound nullifier, and an
+//! encrypted Merkle witness bundle into one verification statement. It is
+//! designed to reject malformed proof objects without panicking and to resist a
 //! computationally bounded prover that does not know the committed short
-//! secret. It does not provide a formally audited zero-knowledge guarantee, and
-//! timing side channels exist on norm checks and polynomial arithmetic.
+//! secret. It does not provide a formally audited hidden-member proof system;
+//! the verifier decrypts the witness bundle during verification.
 
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -22,27 +22,42 @@ const MAX_ATTEMPTS: u32 = 1000;
 
 /// Lattice-based authorization proof for one credential and scope.
 ///
-/// The proof carries the public key, bounded response, Fiat-Shamir challenge,
-/// nullifier, Merkle path, and commitment transcript needed by the verifier.
-/// It enforces no trust by construction after deserialization; callers must run
-/// verification against trusted public inputs before accepting it. The
-/// nullifier and Merkle path are public and may be linkable.
+/// The proof carries the bounded response, Fiat-Shamir challenge, nullifier,
+/// credential commitment, transcript commitment, and an encrypted witness
+/// bundle. The public key and Merkle path are not plaintext proof fields.
+/// Callers must run verification against authenticated public inputs before
+/// accepting it. The nullifier remains public by design for scope-local replay
+/// detection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthProof {
-    /// Public key vector whose commitment is proven in the Merkle tree.
-    pub public_key: PolyVec,
     /// Response vector z = y + c·s mod q ∈ R_q^k.
     pub z: PolyVec,
     /// Challenge polynomial c ∈ R_q with τ non-zero ±1 coefficients.
     pub c: Poly,
     /// Nullifier: SHAKE-256("NUL_DOM" ∥ s ∥ scope), 32 bytes.
     pub nullifier: [u8; 32],
-    /// Merkle inclusion proof for the public key commitment.
-    pub merkle_path: MerkleProof,
     /// The commitment hash of the prover's public key (Merkle leaf).
     pub commitment_hash: [u8; 32],
     /// Serialized commitment w = A · y mod q (for challenge reconstruction).
     pub w_bytes: Vec<u8>,
+    /// Root/scope/nullifier-bound encrypted public key and Merkle path.
+    pub witness_ciphertext: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HiddenWitness {
+    public_key: PolyVec,
+    merkle_path: MerkleProof,
+}
+
+struct WitnessContext<'a> {
+    root: &'a [u8; 32],
+    nullifier: &'a [u8; 32],
+    commitment_hash: &'a [u8; 32],
+    w_bytes: &'a [u8],
+    c: &'a Poly,
+    z: &'a PolyVec,
+    scope: &'a [u8],
 }
 
 /// Derives the nullifier for a secret key and authorization scope.
@@ -60,6 +75,22 @@ pub fn derive_nullifier(secret_key: &PolyVec, scope: &[u8]) -> [u8; 32] {
     let mut output = [0u8; 32];
     hasher.finalize_xof().read(&mut output);
     output
+}
+
+fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+fn ct_eq_poly(a: &Poly, b: &Poly) -> bool {
+    let mut diff = 0i64;
+    for i in 0..crate::poly::N {
+        diff |= a.coeffs[i] ^ b.coeffs[i];
+    }
+    diff == 0
 }
 
 /// Compute the challenge hash seed from the proof transcript.
@@ -83,6 +114,65 @@ fn challenge_hash_seed(
     let mut seed = vec![0u8; 64];
     hasher.finalize_xof().read(&mut seed);
     seed
+}
+
+fn witness_keystream_seed(ctx: &WitnessContext<'_>) -> Vec<u8> {
+    let mut hasher = Shake256::default();
+    hasher.update(b"WIT_ENC");
+    hasher.update(ctx.root);
+    hasher.update(ctx.nullifier);
+    hasher.update(ctx.commitment_hash);
+    hasher.update(ctx.w_bytes);
+    hasher.update(&ctx.c.to_bytes());
+    hasher.update(&ctx.z.to_bytes());
+    hasher.update(ctx.scope);
+    let mut seed = vec![0u8; 64];
+    hasher.finalize_xof().read(&mut seed);
+    seed
+}
+
+fn apply_witness_stream(data: &[u8], seed: &[u8]) -> Vec<u8> {
+    let mut hasher = Shake256::default();
+    hasher.update(seed);
+    let mut xof = hasher.finalize_xof();
+    let mut stream = vec![0u8; data.len()];
+    xof.read(&mut stream);
+    data.iter()
+        .zip(stream)
+        .map(|(byte, mask)| byte ^ mask)
+        .collect()
+}
+
+fn encrypt_witness(
+    witness: &HiddenWitness,
+    ctx: &WitnessContext<'_>,
+) -> Result<Vec<u8>, ProtocolError> {
+    let encoded = serde_json::to_vec(witness).map_err(|e| ProtocolError::SerializationError {
+        reason: e.to_string(),
+    })?;
+    let seed = witness_keystream_seed(ctx);
+    Ok(apply_witness_stream(&encoded, &seed))
+}
+
+fn decrypt_witness(
+    proof: &AuthProof,
+    root: &[u8; 32],
+    scope: &[u8],
+) -> Result<HiddenWitness, ProtocolError> {
+    let ctx = WitnessContext {
+        root,
+        nullifier: &proof.nullifier,
+        commitment_hash: &proof.commitment_hash,
+        w_bytes: &proof.w_bytes,
+        c: &proof.c,
+        z: &proof.z,
+        scope,
+    };
+    let seed = witness_keystream_seed(&ctx);
+    let encoded = apply_witness_stream(&proof.witness_ciphertext, &seed);
+    serde_json::from_slice(&encoded).map_err(|e| ProtocolError::SerializationError {
+        reason: e.to_string(),
+    })
 }
 
 /// Generates an authorization proof for a committed credential.
@@ -118,11 +208,17 @@ pub fn prove<R: RngCore + CryptoRng + ?Sized>(
     rng: &mut R,
 ) -> Result<AuthProof, ProtocolError> {
     let nullifier = derive_nullifier(&keypair.secret_key, scope);
-    if &nullifier != expected_nullifier {
+    if !ct_eq_32(&nullifier, expected_nullifier) {
         return Err(ProtocolError::ChallengeFailure);
     }
 
     let credential_commitment = commitment_hash(&keypair.public_key);
+    if !ct_eq_32(&merkle_proof.leaf, &credential_commitment)
+        || !ct_eq_32(&merkle_proof.root, root)
+        || !crate::tree::MerkleTree::verify_inclusion_proof(merkle_proof)
+    {
+        return Err(ProtocolError::ChallengeFailure);
+    }
 
     for _attempt in 0..MAX_ATTEMPTS {
         let masking_vector = PolyVec::sample_masking(rng);
@@ -137,18 +233,32 @@ pub fn prove<R: RngCore + CryptoRng + ?Sized>(
         let response = masking_vector.add(&challenge_secret);
 
         let bound = GAMMA1 - BETA;
-        if response.infinity_norm() >= bound {
+        if !response.infinity_norm_lt(bound) {
             continue;
         }
 
-        return Ok(AuthProof {
+        let witness = HiddenWitness {
             public_key: keypair.public_key.clone(),
+            merkle_path: merkle_proof.clone(),
+        };
+        let witness_context = WitnessContext {
+            root,
+            nullifier: &nullifier,
+            commitment_hash: &credential_commitment,
+            w_bytes: &w_bytes,
+            c: &challenge,
+            z: &response,
+            scope,
+        };
+        let witness_ciphertext = encrypt_witness(&witness, &witness_context)?;
+
+        return Ok(AuthProof {
             z: response,
             c: challenge,
             nullifier,
-            merkle_path: merkle_proof.clone(),
             commitment_hash: credential_commitment,
             w_bytes,
+            witness_ciphertext,
         });
     }
 
@@ -179,8 +289,9 @@ pub fn prove<R: RngCore + CryptoRng + ?Sized>(
 ///
 /// # Timing
 ///
-/// This function is not constant-time with respect to its input.
-/// Callers on secret data accept a timing side-channel risk.
+/// Norm and fixed-size transcript comparisons scan their complete inputs
+/// without early exit. Structural parsing can still fail early on malformed
+/// public input.
 ///
 /// # Security
 ///
@@ -195,21 +306,14 @@ pub fn verify(
     expected_nullifier: &[u8; 32],
     scope: &[u8],
 ) -> Result<bool, ProtocolError> {
-    if proof.public_key.polys.len() != K {
-        return Ok(false);
-    }
     if proof.z.polys.len() != K {
         return Ok(false);
     }
 
-    if proof.nullifier != *expected_nullifier {
-        return Ok(false);
-    }
+    let mut valid = ct_eq_32(&proof.nullifier, expected_nullifier);
 
     let bound = GAMMA1 - BETA;
-    if proof.z.infinity_norm() >= bound {
-        return Ok(false);
-    }
+    valid &= proof.z.infinity_norm_lt(bound);
 
     let transcript_commitment = match PolyVec::from_bytes(&proof.w_bytes) {
         Some(transcript_commitment) => transcript_commitment,
@@ -218,7 +322,14 @@ pub fn verify(
 
     let seed = challenge_hash_seed(root, &proof.nullifier, &proof.w_bytes, scope);
     let expected_challenge = sample_challenge(&seed);
-    if expected_challenge != proof.c {
+    valid &= ct_eq_poly(&expected_challenge, &proof.c);
+
+    let witness = match decrypt_witness(proof, root, scope) {
+        Ok(witness) => witness,
+        Err(_) => return Ok(false),
+    };
+
+    if witness.public_key.polys.len() != K {
         return Ok(false);
     }
 
@@ -231,30 +342,19 @@ pub fn verify(
     // Since ||e||_inf <= eta and ||c||_1 = tau, every coefficient of c*e
     // is a signed sum of at most tau error coefficients, each bounded by eta.
     let az = params.matrix_a.mul_vec(&proof.z);
-    let cb = proof.public_key.scalar_mul(&proof.c);
+    let cb = witness.public_key.scalar_mul(&proof.c);
     let diff = az.sub(&transcript_commitment).sub(&cb);
 
     let diff_bound = (TAU as i64) * ETA + 1;
-    if diff.infinity_norm() >= diff_bound {
-        return Ok(false);
-    }
+    valid &= diff.infinity_norm_lt(diff_bound);
 
-    let expected_commitment = commitment_hash(&proof.public_key);
-    if expected_commitment != proof.commitment_hash {
-        return Ok(false);
-    }
+    let expected_commitment = commitment_hash(&witness.public_key);
+    valid &= ct_eq_32(&expected_commitment, &proof.commitment_hash);
+    valid &= ct_eq_32(&witness.merkle_path.leaf, &proof.commitment_hash);
+    valid &= ct_eq_32(&witness.merkle_path.root, root);
+    valid &= crate::tree::MerkleTree::verify_inclusion_proof(&witness.merkle_path);
 
-    if proof.merkle_path.leaf != proof.commitment_hash {
-        return Ok(false);
-    }
-    if proof.merkle_path.root != *root {
-        return Ok(false);
-    }
-    if !crate::tree::MerkleTree::verify_inclusion_proof(&proof.merkle_path) {
-        return Ok(false);
-    }
-
-    Ok(true)
+    Ok(valid)
 }
 
 #[cfg(test)]
@@ -362,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wrong_public_key_rejected() {
+    fn test_tampered_commitment_rejected() {
         let (params, user_kp, _tree, root, merkle_proof) = setup_test_scenario(103);
         // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(203);
@@ -380,12 +480,11 @@ mod tests {
         )
         .expect("Proof generation should succeed");
 
-        let wrong_kp = keygen(&params, &mut rng);
         let mut proof = proof;
-        proof.public_key = wrong_kp.public_key().clone(); // simulate public-key substitution
+        proof.commitment_hash[0] ^= 0x01; // simulate commitment substitution
         let valid =
             verify(&params, &proof, &root, &nullifier, scope).expect("Verification must run");
-        assert!(!valid, "Wrong public key must fail verification");
+        assert!(!valid, "Tampered commitment must fail verification");
     }
 
     #[test]
@@ -440,11 +539,11 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_rejects_wrong_pubkey_len() {
+    fn test_verify_rejects_tampered_witness_ciphertext() {
         let (params, user_kp, _tree, root, merkle_proof) = setup_test_scenario(107);
         // Seeded for test determinism. Production code must use OsRng.
         let mut rng = StdRng::seed_from_u64(207);
-        let scope = b"wrong_pubkey_len";
+        let scope = b"tampered_witness";
 
         let nullifier = derive_nullifier(&user_kp.secret_key, scope);
         let mut proof = prove(
@@ -458,11 +557,35 @@ mod tests {
         )
         .expect("Proof generation should succeed");
 
-        proof.public_key.polys.push(Poly::zero()); // simulate a malformed public-key vector
+        proof.witness_ciphertext[0] ^= 0x01; // simulate encrypted witness tampering
 
         let valid =
             verify(&params, &proof, &root, &nullifier, scope).expect("Verification must run");
-        assert!(!valid, "Malformed public key length must be rejected");
+        assert!(!valid, "Tampered encrypted witness must be rejected");
+    }
+
+    #[test]
+    fn test_serialized_proof_omits_plaintext_member_witness() {
+        let (params, user_kp, _tree, root, merkle_proof) = setup_test_scenario(109);
+        let mut rng = StdRng::seed_from_u64(209);
+        let scope = b"plaintext_witness_check";
+
+        let nullifier = derive_nullifier(&user_kp.secret_key, scope);
+        let proof = prove(
+            &params,
+            &user_kp,
+            &merkle_proof,
+            &root,
+            &nullifier,
+            scope,
+            &mut rng,
+        )
+        .expect("Proof generation should succeed");
+
+        let encoded = serde_json::to_string(&proof).unwrap();
+        assert!(!encoded.contains("\"public_key\""));
+        assert!(!encoded.contains("\"merkle_path\""));
+        assert!(encoded.contains("\"witness_ciphertext\""));
     }
 
     #[test]

@@ -6,7 +6,7 @@ Obscura provides lattice-based credential authorization with Merkle membership p
 
 ## What This Crate Does
 
-Obscura models a credential as Module-LWE-style key material. The public key is committed into a SHAKE-256 Merkle tree, while the secret key remains with the credential holder. A verifier accepts authorization only when a proof binds the public key, the Merkle root, a verifier-chosen scope, and a scope-bound nullifier.
+Obscura models a credential as Module-LWE-style key material. The public key is committed into a SHAKE-256 Merkle tree, while the secret key remains with the credential holder. A verifier accepts authorization only when a proof binds the credential commitment, an authenticated Merkle root, a verifier-chosen scope, and a scope-bound nullifier.
 
 The crate is useful for systems that need a compact authorization root and a public verification artifact. The Merkle tree represents the credential set, the nullifier supports replay or double-use detection within a scope, and the proof relation checks that the response is consistent with the committed key material.
 
@@ -14,17 +14,17 @@ The implementation exposes a high-level API for generating parameters, creating 
 
 ## Security Notice
 Known limitations:
-- Polynomial arithmetic, coefficient comparisons, and norm checks are not constant-time.
+- Polynomial arithmetic and norm-bound checks use fixed-dimension loops and full-scan comparisons for the proof paths in this crate. The implementation has not received an external side-channel audit.
 - The proof construction and parameter choices require independent cryptographic review before deployment.
-- Merkle roots and parameter seeds must be authenticated by the application; the crate does not establish trust in those values.
-- Serialized proofs are public verification artifacts, but nullifiers and Merkle paths can be linkable across repeated use.
+- Verifier APIs require an `AuthenticatedRoot` bound to the MLWE parameter digest. Applications still need to authenticate the root and parameter source before constructing that wrapper.
+- Serialized proofs no longer expose the public key or Merkle path as plaintext fields. Nullifiers remain public and scope-bound with `SHAKE-256("NUL_DOM" || s || scope)` for replay detection within the selected scope.
 
 ## Quick Start
 
 ```rust
 use rand::rngs::OsRng;
 use obscura::mlwe::MlweParams;
-use obscura::protocol::{KeyPair, Prover, PublicInputs, Verifier};
+use obscura::protocol::{AuthenticatedRoot, KeyPair, Prover, PublicInputs, Verifier};
 use obscura::tree::MerkleTree;
 
 fn main() -> Result<(), obscura::error::ProtocolError> {
@@ -36,7 +36,8 @@ fn main() -> Result<(), obscura::error::ProtocolError> {
     let root = tree.root()?;
     let path = tree.generate_inclusion_proof(index)?;
     let scope = b"session-challenge".to_vec();
-    let inputs = PublicInputs { merkle_root: root, scope: scope.clone(), nullifier: user.nullifier(&scope) };
+    let authenticated_root = AuthenticatedRoot::from_trusted_source(root, &params);
+    let inputs = PublicInputs::new_authenticated(authenticated_root, scope.clone(), user.nullifier(&scope));
     let proof = Prover::generate_proof(&params, &user, &path, &inputs, &mut rng)?;
     assert!(Verifier::verify_proof(&params, &proof, &inputs)?);
     Ok(())

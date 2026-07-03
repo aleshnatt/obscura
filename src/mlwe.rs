@@ -3,8 +3,8 @@
 //! The module builds public matrices, short secret vectors, public key vectors,
 //! and sparse Fiat-Shamir challenges used by the proof relation. It targets
 //! computational adversaries that cannot recover a short secret from the public
-//! Module-LWE-style relation. It does not provide side-channel resistance, and
-//! its concrete security level requires independent parameter review.
+//! Module-LWE-style relation. Its concrete security level requires independent
+//! parameter review.
 
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,26 @@ impl MlweParams {
         MlweParams {
             matrix_a: PolyMat { rows },
         }
+    }
+
+    /// Computes a stable authentication digest for this parameter set.
+    ///
+    /// # Security
+    ///
+    /// Applications can pin or sign this digest alongside a Merkle root to
+    /// ensure verifiers use the same public matrix as provers. The digest is
+    /// not secret and does not make adversary-selected parameters trustworthy
+    /// unless the application authenticates it.
+    #[must_use]
+    pub fn authentication_digest(&self) -> [u8; 32] {
+        let mut hasher = Shake256::default();
+        hasher.update(b"PARAM_DOM");
+        for row in &self.matrix_a.rows {
+            hasher.update(&row.to_bytes());
+        }
+        let mut output = [0u8; 32];
+        hasher.finalize_xof().read(&mut output);
+        output
     }
 }
 
